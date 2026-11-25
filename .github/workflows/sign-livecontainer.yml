@@ -1,0 +1,124 @@
+name: Sign LiveContainer+SideStore IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      interactive_ssh:
+        description: 'Open SSH session (for first-time 2FA login or manual debugging)'
+        type: boolean
+        default: false
+      ipa_variant:
+        description: 'Which official LiveContainer IPA to download'
+        type: choice
+        default: 'LiveContainer+SideStore.ipa'
+        options:
+          - 'LiveContainer+SideStore.ipa'
+          - 'LiveContainer.ipa'
+      custom_bundle_id:
+        description: 'Optional: Override Bundle ID (leave blank to keep default)'
+        type: string
+        default: ''
+
+jobs:
+  sign-ipa:
+    runs-on: macos-latest # Apple Silicon (arm64) free macOS runner
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Splice CLI and dependencies
+        run: |
+          brew update
+          brew install franklintra/tap/splice openssl@3 jq
+          splice --version
+
+      - name: Download latest LiveContainer IPA from GitHub Releases
+        env:
+          IPA_VARIANT: ${{ inputs.ipa_variant }}
+        run: |
+          mkdir -p work output
+          RELEASE_JSON=$(curl -fsSL https://api.github.com/repos/LiveContainer/LiveContainer/releases/latest)
+          DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r --arg name "$IPA_VARIANT" '.assets[] | select(.name == $name) | .browser_download_url')
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
+            echo "Error: Could not find asset $IPA_VARIANT in latest LiveContainer release."
+            exit 1
+          fi
+
+          echo "Downloading $IPA_VARIANT from $DOWNLOAD_URL..."
+          curl -fL "$DOWNLOAD_URL" -o "work/$IPA_VARIANT"
+          ls -lh "work/$IPA_VARIANT"
+
+      - name: Restore cached Apple GS session & ADI machine state
+        if: ${{ secrets.SPLICE_STATE_B64 != '' }}
+        run: |
+          mkdir -p "$HOME/Library/Application Support"
+          echo "${{ secrets.SPLICE_STATE_B64 }}" | base64 -d > work/splice_state.tar.gz
+          tar -xzf work/splice_state.tar.gz -C "$HOME/Library/Application Support"
+          echo "Restored cached Splice session and machine identity."
+
+      - name: Interactive SSH Session (First-Time 2FA & State Export)
+        if: ${{ inputs.interactive_ssh == true }}
+        uses: owenthereal/action-upterm@v2
+        with:
+          limit-access-to-actor: true
+          wait-timeout-minutes: 15
+
+      - name: Register UDID, Provision & Sign IPA (Headless)
+        if: ${{ inputs.interactive_ssh == false }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          DEVICE_UDID: ${{ secrets.DEVICE_UDID }}
+          IPA_VARIANT: ${{ inputs.ipa_variant }}
+          CUSTOM_BUNDLE_ID: ${{ inputs.custom_bundle_id }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_PASSWORD:-}" ] || [ -z "${DEVICE_UDID:-}" ]; then
+            echo "Missing required secrets: APPLE_ID, APPLE_PASSWORD, or DEVICE_UDID."
+            exit 1
+          fi
+
+          # 1. Authenticate (uses cached GS token if valid; falls back to credentials)
+          splice login --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD"
+
+          # 2. Ensure your iPhone UDID is registered on your Personal Team
+          splice device add --udid "$DEVICE_UDID" --name "iPhone-Remote" || true
+
+          # 3. Extract IPA & inspect original Bundle ID so it overwrites your existing app cleanly
+          unzip -q "work/$IPA_VARIANT" -d work/extracted
+          APP_BUNDLE=$(find work/extracted/Payload -maxdepth 1 -name "*.app" | head -n 1)
+          ORIG_BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_BUNDLE/Info.plist")
+          TARGET_BUNDLE_ID="${CUSTOM_BUNDLE_ID:-$ORIG_BUNDLE_ID}"
+          echo "Target Bundle ID: $TARGET_BUNDLE_ID"
+
+          # 4. Generate Key + CSR & request/fetch Personal Team Development Certificate
+          openssl genrsa -out work/privatekey.pem 2048
+          openssl req -new -key work/privatekey.pem -out work/csr.csr -subj "/CN=Splice-GHA"
+          splice cert request --csr work/csr.csr --out work/dev_cert.cer || splice cert download --out work/dev_cert.cer
+
+          # 5. Register App ID & download matching .mobileprovision for your UDID
+          splice app-id add --bundle-id "$TARGET_BUNDLE_ID" --name "LiveContainer" || true
+          splice app-id provision --bundle-id "$TARGET_BUNDLE_ID" --out work/profile.mobileprovision
+
+          # 6. Sign the .app bundle (preserves LiveContainer entitlements & nested plugins/SideStore)
+          splice sign \
+            --cert work/dev_cert.cer \
+            --key work/privatekey.pem \
+            --provision work/profile.mobileprovision \
+            "$APP_BUNDLE"
+
+          # 7. Repackage into clean signed .ipa
+          (cd work/extracted && zip -qr "../../output/LiveContainer-Signed.ipa" Payload)
+          ls -lh output/LiveContainer-Signed.ipa
+
+      - name: Upload Signed IPA Artifact
+        if: ${{ inputs.interactive_ssh == false && hashFiles('output/LiveContainer-Signed.ipa') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainer-Signed
+          path: output/LiveContainer-Signed.ipa
+          retention-days: 3
