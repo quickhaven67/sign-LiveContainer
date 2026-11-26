@@ -231,6 +231,52 @@ jobs:
             --custom-identifier "$BUNDLE_ID" \
             --output build/LiveContainer+SideStore-signed.ipa
 
+      - name: Inspect signed IPA (diagnostics only)
+        continue-on-error: true
+        run: |
+          rm -rf build/inspect && mkdir -p build/inspect
+          unzip -q build/LiveContainer+SideStore-signed.ipa -d build/inspect
+          python3 - <<'PY'
+          import glob, os, plistlib, subprocess
+
+          UDID = os.environ["UDID"].lower()
+          WANT = os.environ["BUNDLE_ID"]
+          app = glob.glob("build/inspect/Payload/*.app")[0]
+
+          def info(b):
+              with open(b + "/Info.plist", "rb") as f:
+                  return plistlib.load(f)
+
+          def ents(path):
+              r = subprocess.run(["codesign", "-d", "--entitlements", ":-", path], capture_output=True)
+              return plistlib.loads(r.stdout) if r.stdout.strip() else {}
+
+          def profile(b):
+              p = b + "/embedded.mobileprovision"
+              if not os.path.exists(p):
+                  return None
+              r = subprocess.run(["security", "cms", "-D", "-i", p], capture_output=True)
+              return plistlib.loads(r.stdout) if r.stdout.strip() else None
+
+          for b in [app] + sorted(glob.glob(app + "/PlugIns/*.appex")):
+              i = info(b)
+              exe = os.path.join(b, i["CFBundleExecutable"])
+              e = ents(exe)
+              print("==", os.path.basename(b))
+              print("bundle id:", i["CFBundleIdentifier"],
+                    "| matches manifest:" , i["CFBundleIdentifier"] == WANT if b == app else "n/a")
+              print("binary entitlements:", sorted(e))
+              pr = profile(b)
+              if pr is None:
+                  print("NO embedded.mobileprovision")
+                  continue
+              devs = [d.lower() for d in pr.get("ProvisionedDevices", [])]
+              print("profile:", pr.get("Name"), "| team:", pr.get("TeamIdentifier"), "| expires:", pr.get("ExpirationDate"))
+              print("devices in profile:", len(devs), "| your UDID included:", UDID in devs)
+              granted = pr.get("Entitlements", {})
+              print("entitlements NOT granted by profile:", sorted(k for k in e if k not in granted) or "none")
+          PY
+
       - name: Host IPA and update Gist manifest
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
