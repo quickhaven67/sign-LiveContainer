@@ -12,6 +12,10 @@ on:
         required: false
         type: boolean
         default: true
+      bundle_id:
+        description: "Signed bundle ID. Changing it creates 5 NEW App IDs (free accounts: max 10 per 7 days). Leave default normally."
+        required: false
+        default: "com.kdt.livecontainer.V9CQYDJ2NX.v2"
       strip_restricted:
         description: "Also strip HealthKit + increased-memory-limit entitlements before signing"
         required: false
@@ -33,7 +37,8 @@ jobs:
     timeout-minutes: 60
     env:
       GIST_ID: a780f323dcc1db7243c296f4997f43e9
-      BUNDLE_ID: com.kdt.livecontainer.V9CQYDJ2NX
+      BUNDLE_ID: ${{ inputs.bundle_id || 'com.kdt.livecontainer.V9CQYDJ2NX.v2' }}
+      TEAM_ID: V9CQYDJ2NX
       UDID: 00008130-0014442622DB803A
     steps:
       - name: Checkout repository
@@ -168,6 +173,10 @@ jobs:
             echo '```'
             plumesign --help 2>&1
             echo '```'
+            echo "### plumesign account --help"
+            echo '```'
+            plumesign account --help 2>&1
+            echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Download source IPA
@@ -242,8 +251,41 @@ jobs:
           (cd build/pre && zip -qry ../stripped.ipa Payload)
           ls -lh build/stripped.ipa
 
+      - name: Restore saved Apple session
+        uses: actions/cache/restore@v4
+        with:
+          path: session.enc
+          key: plume-session-none
+          restore-keys: |
+            plume-session-
+
+      - name: Check saved Apple session
+        id: session
+        env:
+          SESSION_KEY: ${{ secrets.SESSION_KEY || secrets.GIST_TOKEN }}
+        run: |
+          ok=false
+          if [ -f session.enc ] && [ -n "$SESSION_KEY" ]; then
+            mkdir -p "$HOME/.config"
+            if openssl enc -d -aes-256-cbc -pbkdf2 -pass env:SESSION_KEY -in session.enc | tar -x -C "$HOME/.config"; then
+              echo "Restored saved session, testing it against Apple..."
+              if plumesign account devices -t "$TEAM_ID" > /tmp/devs.txt 2>&1; then
+                ok=true
+                echo "Saved session works - skipping SSH login."
+              else
+                echo "Saved session no longer works:"; tail -5 /tmp/devs.txt
+                rm -rf "$HOME/.config/PlumeImpactor"
+              fi
+            else
+              echo "Could not decrypt saved session."
+            fi
+          else
+            echo "No saved session found."
+          fi
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+
       - name: Open upterm session before authentication
-        if: inputs.ssh_before_auth
+        if: inputs.ssh_before_auth && steps.session.outputs.ok != 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -254,7 +296,7 @@ jobs:
           "$HOME/bin/start_upterm.sh" "In the SSH session run: ~/login_apple.sh  then type exit to continue."
 
       - name: Authenticate with Apple Developer account
-        if: ${{ !inputs.ssh_before_auth }}
+        if: ${{ !inputs.ssh_before_auth && steps.session.outputs.ok != 'true' }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -403,6 +445,26 @@ jobs:
             echo "local size: $(stat -f%z "$IPA")"
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Pack Apple session (encrypted)
+        if: always()
+        id: pack
+        env:
+          SESSION_KEY: ${{ secrets.SESSION_KEY || secrets.GIST_TOKEN }}
+        run: |
+          if [ -f "$HOME/.config/PlumeImpactor/accounts.json" ] && [ -n "$SESSION_KEY" ]; then
+            tar -c -C "$HOME/.config" PlumeImpactor | openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:SESSION_KEY -out session.enc
+            echo "packed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No session to save."
+          fi
+
+      - name: Save Apple session
+        if: always() && steps.pack.outputs.packed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: session.enc
+          key: plume-session-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Open upterm on failure
         if: failure() && inputs.debug_upterm
