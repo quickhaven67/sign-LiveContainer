@@ -128,7 +128,14 @@ jobs:
           export PATH="$HOME/bin:$PATH"
           ID=$(printf '%s' "$APPLE_ID" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
           PW=$(printf '%s' "$APPLE_PASSWORD" | tr -d '\r\n')
+          touch /tmp/before_login
           plumesign account login --username "$ID" --password "$PW" || exit 1
+          echo
+          echo "== Files created/changed by login (session storage) =="
+          find "$HOME" /Users/runner/Library /tmp -newer /tmp/before_login -type f \
+            -not -path "*/.ssh/*" -not -path "$HOME/bin/*" -not -path "*/upterm*" \
+            -not -name before_login 2>/dev/null | head -50
+          echo "== end =="
 
           # Interactive (SSH) only: check this phone is registered on the account
           if [ -t 0 ] && [ -n "$UDID" ]; then
@@ -148,6 +155,20 @@ jobs:
           LOGIN_SH
 
           chmod +x "$HOME/bin/start_upterm.sh" "$HOME/login_apple.sh"
+
+      - name: Show plumesign options (diagnostics only)
+        continue-on-error: true
+        run: |
+          {
+            echo "### plumesign sign --help"
+            echo '```'
+            plumesign sign --help 2>&1
+            echo '```'
+            echo "### plumesign --help"
+            echo '```'
+            plumesign --help 2>&1
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Download source IPA
         env:
