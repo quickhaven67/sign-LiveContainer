@@ -1,116 +1,120 @@
-name: Sign LiveContainer+SideStore IPA
+name: Sign LiveContainer OTA
 
 on:
   workflow_dispatch:
     inputs:
-      interactive_ssh:
-        description: 'Open SSH session (for first-time 2FA login or manual debugging)'
+      ipa_url:
+        description: "Direct URL to source LiveContainer+SideStore.ipa (defaults to latest release asset)"
+        required: false
+        default: ""
+      debug_upterm:
+        description: "Start upterm SSH session on failure"
+        required: false
         type: boolean
         default: false
-      ipa_variant:
-        description: 'Which official LiveContainer IPA to download'
-        type: choice
-        default: 'LiveContainer+SideStore.ipa'
-        options:
-          - 'LiveContainer+SideStore.ipa'
-          - 'LiveContainer.ipa'
-      custom_bundle_id:
-        description: 'Optional: Override Bundle ID (leave blank to keep default)'
-        type: string
-        default: ''
 
 jobs:
-  sign-ipa:
+  sign-and-publish:
     runs-on: macos-latest
-    timeout-minutes: 25
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Splice CLI and dependencies
+      - name: Install plumesign and tools
         run: |
-          brew update
-          brew install franklintra/tap/splice openssl@3 jq
-          splice --help
-
-      - name: Download latest Nightly LiveContainer IPA
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IPA_VARIANT: ${{ inputs.ipa_variant }}
-        run: |
-          mkdir -p work output
-          gh release download nightly \
-            --repo LiveContainer/LiveContainer \
-            --pattern "$IPA_VARIANT" \
-            --dir work
-          ls -lh "work/$IPA_VARIANT"
-
-      - name: Restore cached Apple GS session & ADI machine state
-        env:
-          SPLICE_STATE_B64: ${{ secrets.SPLICE_STATE_B64 }}
-        run: |
-          if [ -n "$SPLICE_STATE_B64" ]; then
-            mkdir -p "$HOME/Library/Application Support"
-            echo "$SPLICE_STATE_B64" | base64 -d > work/splice_state.tar.gz
-            tar -xzf work/splice_state.tar.gz -C "$HOME/Library/Application Support"
-            echo "Restored cached Splice session and machine identity."
-          else
-            echo "No SPLICE_STATE_B64 secret set yet; skipping state restore."
+          brew install jq || true
+          if ! command -v plumesign >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/plumesign.tar.gz "https://github.com/claration/impactor/releases/latest/download/plumesign-macos-arm64.tar.gz" || true
+            tar -xzf /tmp/plumesign.tar.gz -C /usr/local/bin/ 2>/dev/null || true
           fi
 
-      - name: Interactive SSH Session (First-Time 2FA & State Export)
-        if: ${{ inputs.interactive_ssh == true }}
-        uses: owenthereal/action-upterm@v2
-        with:
-          limit-access-to-actor: true
-          wait-timeout-minutes: 15
-
-      - name: Register UDID, Provision & Sign IPA (Headless)
-        if: ${{ inputs.interactive_ssh == false }}
+      - name: Authenticate with Apple Developer account
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          DEVICE_UDID: ${{ secrets.DEVICE_UDID }}
-          IPA_VARIANT: ${{ inputs.ipa_variant }}
-          CUSTOM_BUNDLE_ID: ${{ inputs.custom_bundle_id }}
+          TWO_FACTOR_CODE: ${{ secrets.TWO_FACTOR_CODE }}
         run: |
-          set -euo pipefail
+          plumesign account login --username "$APPLE_ID" --password "$APPLE_PASSWORD" ${TWO_FACTOR_CODE:+--code "$TWO_FACTOR_CODE"}
 
-          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_PASSWORD:-}" ] || [ -z "${DEVICE_UDID:-}" ]; then
-            echo "Missing required secrets: APPLE_ID, APPLE_PASSWORD, or DEVICE_UDID."
-            exit 1
+      - name: Download source IPA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_IPA_URL: ${{ inputs.ipa_url }}
+        run: |
+          mkdir -p build
+          if [ -n "$INPUT_IPA_URL" ]; then
+            curl -fsSL -o build/source.ipa "$INPUT_IPA_URL"
+          else
+            ASSET_URL=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 5 --json tagName,assets --jq '[.[] | .assets[]? | select(.name | test("LiveContainer.*\\.ipa$"; "i")) | select(.name | test("signed|fixed"; "i") | not)][0].url')
+            [ -z "$ASSET_URL" ] && ASSET_URL=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 5 --json assets --jq '[.[] | .assets[]?][0].url')
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o build/source.ipa "$ASSET_URL"
           fi
+          ls -lh build/source.ipa
 
-          splice login --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD"
-          splice device add --udid "$DEVICE_UDID" --name "iPhone-Remote" || true
+      - name: Sign IPA with plumesign
+        run: |
+          plumesign sign \
+            --input build/source.ipa \
+            --output build/LiveContainer+SideStore-signed.ipa \
+            --bundle-id com.kdt.livecontainer.V9CQYDJ2NX \
+            --udid 00008130-0014442622DB803A
 
-          unzip -q "work/$IPA_VARIANT" -d work/extracted
-          APP_BUNDLE=$(find work/extracted/Payload -maxdepth 1 -name "*.app" | head -n 1)
-          ORIG_BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_BUNDLE/Info.plist")
-          TARGET_BUNDLE_ID="${CUSTOM_BUNDLE_ID:-$ORIG_BUNDLE_ID}"
-          echo "Target Bundle ID: $TARGET_BUNDLE_ID"
+      - name: Strip application-groups from signed Mach-O entitlements and re-sign
+        run: |
+          rm -rf build/resign && mkdir -p build/resign
+          unzip -q build/LiveContainer+SideStore-signed.ipa -d build/resign
+          CERT=$(security find-identity -v -p codesigning | awk '/Dennis Lawson/{print $2; exit}')
+          export CERT
+          python3 - <<'PY'
+          import glob, os, plistlib, re, subprocess
 
-          openssl genrsa -out work/privatekey.pem 2048
-          openssl req -new -key work/privatekey.pem -out work/csr.csr -subj "/CN=Splice-GHA"
-          splice cert request --csr work/csr.csr --out work/dev_cert.cer || splice cert download --out work/dev_cert.cer
+          bins = sorted(
+              glob.glob("build/resign/Payload/*.app/LiveContainer")
+              + glob.glob("build/resign/Payload/*.app/PlugIns/*.appex/*")
+          )
+          for p in bins:
+              if not os.path.isfile(p) or os.path.islink(p):
+                  continue
+              if p.endswith((".plist", ".car", ".mobileprovision", ".appintents", ".intentdefinition", ".bundle")):
+                  continue
+              raw = open(p, "rb").read().decode("latin1")
+              matches = re.findall(r"<\?xml.*?</plist>", raw, re.S)
+              for m in matches:
+                  if "com.apple.security.application-groups" in m:
+                      d = plistlib.loads(m.encode("utf-8"))
+                      d.pop("com.apple.security.application-groups", None)
+                      ent_path = p + ".entitlements.plist"
+                      with open(ent_path, "wb") as f:
+                          plistlib.dump(d, f)
+                      subprocess.run(
+                          ["codesign", "-f", "-s", os.environ["CERT"], "--entitlements", ent_path, "--timestamp=none", p],
+                          check=False,
+                      )
+                      break
+          PY
+          find build/resign/Payload/LiveContainer.app -depth \( -name "*.dylib" -o -name "*.framework" -o -name "*.appex" \) -exec codesign -f -s "$CERT" --timestamp=none {} + 2>/dev/null || true
+          MAIN_ENT="build/resign/Payload/LiveContainer.app/LiveContainer.entitlements.plist"
+          [ -f "$MAIN_ENT" ] && codesign -f -s "$CERT" --entitlements "$MAIN_ENT" --timestamp=none build/resign/Payload/LiveContainer.app || true
+          (cd build/resign && zip -qry ../final.ipa Payload) && mv build/final.ipa build/LiveContainer+SideStore-signed.ipa
+          ls -lh build/LiveContainer+SideStore-signed.ipa
 
-          splice app-id add --bundle-id "$TARGET_BUNDLE_ID" --name "LiveContainer" || true
-          splice app-id provision --bundle-id "$TARGET_BUNDLE_ID" --out work/profile.mobileprovision
+      - name: Host IPA and update Gist manifest
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          IPA_URL=$(curl -fsSL -F "file=@build/LiveContainer+SideStore-signed.ipa" https://pixeldrain.com/api/file 2>/dev/null | jq -r '.id // empty' | xargs -I{} echo "https://pixeldrain.com/api/file/{}?download")
+          if [ -z "$IPA_URL" ]; then
+            TAG="signed-$(date +%s)"
+            gh release create "$TAG" build/LiveContainer+SideStore-signed.ipa --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Automated OTA build" --prerelease
+            IPA_URL=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[0].browserDownloadUrl')
+          fi
+          echo "IPA_URL=$IPA_URL"
+          IPA_URL="$IPA_URL" GIST_TOKEN="$GIST_TOKEN" python3 - <<'PY'
+          import json, os, urllib.parse, urllib.request
 
-          splice sign \
-            --cert work/dev_cert.cer \
-            --key work/privatekey.pem \
-            --provision work/profile.mobileprovision \
-            "$APP_BUNDLE"
-
-          (cd work/extracted && zip -qr "../../output/LiveContainer-Signed.ipa" Payload)
-          ls -lh output/LiveContainer-Signed.ipa
-
-      - name: Upload Signed IPA Artifact
-        if: ${{ inputs.interactive_ssh == false && hashFiles('output/LiveContainer-Signed.ipa') != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: LiveContainer-Signed
-          path: output/LiveContainer-Signed.ipa
-          retention-days: 3
+          ipa_url = os.environ["IPA_URL"]
+          gist_token = os.environ.get("GIST_TOKEN", "")
+          plist_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict><key>items</key><array><dict><key>assets</key><array><dict><key>kind</key><string>software-package</string><key>url</key><string>{ipa_url}</string></dict></array><key>metadata</key><dict><key>bundle-identifier</key><string>com.kdt.livecontainer.V9CQYDJ2NX</string><key>bundle-version</key><string>1.0</string><key>kind</key><string>software</string><key>
