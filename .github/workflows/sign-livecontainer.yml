@@ -27,29 +27,75 @@ jobs:
 
       - name: Install plumesign and tools
         run: |
-          brew install jq upterm || true
-          mkdir -p "$HOME/bin"
+          brew install jq || true
+          brew install owenthereal/upterm/upterm
+          mkdir -p "$HOME/bin" "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          [ -f "$HOME/.ssh/id_ed25519" ] || ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
           curl -fsSL -L -o "$HOME/bin/plumesign" "https://github.com/claration/impactor/releases/latest/download/plumesign-macos-universal"
           chmod +x "$HOME/bin/plumesign"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           "$HOME/bin/plumesign" --help >/dev/null
+          upterm version
 
       - name: Open upterm session before authentication
         if: inputs.ssh_before_auth
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
         run: |
           CLEAN_ID=$(printf '%s' "$APPLE_ID" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
           CLEAN_PW=$(printf '%s' "$APPLE_PASSWORD" | tr -d '\r\n')
           cat <<EOF > "$HOME/login_apple.sh"
           #!/usr/bin/env bash
-          export PATH="\$HOME/bin:\$PATH"
+          set -e
+          export PATH="$HOME/bin:\$PATH"
           plumesign account login --username "$CLEAN_ID" --password "$CLEAN_PW"
           EOF
           chmod +x "$HOME/login_apple.sh"
-          echo "Run ~/login_apple.sh in the SSH session to authenticate interactively, then exit tmux/upterm to continue."
-          upterm host --accept-host-key --force-command "bash -l" -- tmux new -As auth
+
+          upterm host --accept-host-key --force-command "bash -l" >/tmp/upterm.log 2>&1 &
+          UPTERM_PID=$!
+
+          SSH_CMD=""
+          for _ in $(seq 1 30); do
+            if SSH_CMD=$(upterm session current --json 2>/dev/null | jq -r '.ssh // empty') && [ -n "$SSH_CMD" ]; then
+              break
+            fi
+            SSH_CMD=$(upterm session current 2>/dev/null | awk '/ssh /{print; exit}')
+            [ -n "$SSH_CMD" ] && break
+            sleep 1
+          done
+          [ -z "$SSH_CMD" ] && SSH_CMD=$(grep -E 'ssh ' /tmp/upterm.log | head -n 1 || true)
+
+          echo "UPTERM_SSH=$SSH_CMD"
+          if [ -n "$GIST_TOKEN" ] && [ -n "$SSH_CMD" ]; then
+            SSH_CMD="$SSH_CMD" GIST_TOKEN="$GIST_TOKEN" python3 - <<'PY'
+            import json, os, urllib.request
+
+            payload = json.dumps({
+                "files": {
+                    "upterm_ssh.txt": {
+                        "content": f"Run in SSH: ~/login_apple.sh\nThen exit SSH to continue.\n{os.environ['SSH_CMD']}\n"
+                    }
+                }
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.github.com/gists/a780f323dcc1db7243c296f4997f43e9",
+                data=payload,
+                method="PATCH",
+                headers={
+                    "Authorization": f"Bearer {os.environ['GIST_TOKEN']}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "github-actions",
+                },
+            )
+            urllib.request.urlopen(req, timeout=20).read()
+            PY
+          fi
+
+          wait "$UPTERM_PID" || true
 
       - name: Authenticate with Apple Developer account
         env:
@@ -167,5 +213,7 @@ jobs:
       - name: Start upterm on failure if requested
         if: failure() && inputs.debug_upterm
         run: |
-          brew install upterm || true
-          upterm host --accept-host-key --force-command "bash -l" -- tmux new -As debug
+          brew install owenthereal/upterm/upterm || true
+          mkdir -p "$HOME/.ssh"
+          [ -f "$HOME/.ssh/id_ed25519" ] || ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
+          upterm host --accept-host-key --force-command "bash -l"
