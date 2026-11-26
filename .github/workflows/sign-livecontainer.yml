@@ -12,6 +12,11 @@ on:
         required: false
         type: boolean
         default: true
+      strip_restricted:
+        description: "Also strip HealthKit + increased-memory-limit entitlements before signing"
+        required: false
+        type: boolean
+        default: true
       debug_upterm:
         description: "Open upterm SSH session on failure"
         required: false
@@ -164,13 +169,22 @@ jobs:
           ls -lh build/source.ipa
 
       - name: Strip application-groups from source IPA entitlements
+        env:
+          STRIP_EXTRA: ${{ inputs.strip_restricted }}
         run: |
           rm -rf build/pre && mkdir -p build/pre
           unzip -q build/source.ipa -d build/pre
           python3 - <<'PY'
           import glob, os, plistlib, subprocess, tempfile
 
-          KEY = "com.apple.security.application-groups"
+          KEYS = ["com.apple.security.application-groups"]
+          if os.environ.get("STRIP_EXTRA") == "true":
+              KEYS += [
+                  "com.apple.developer.healthkit",
+                  "com.apple.developer.healthkit.access",
+                  "com.apple.developer.healthkit.background-delivery",
+                  "com.apple.developer.kernel.increased-memory-limit",
+              ]
           app = glob.glob("build/pre/Payload/*.app")[0]
           bundles = [app] + sorted(glob.glob(app + "/PlugIns/*.appex"))
           changed = 0
@@ -186,10 +200,13 @@ jobs:
                   print("no embedded entitlements:", path)
                   continue
               ent = plistlib.loads(r.stdout)
-              if KEY not in ent:
-                  print("no app-groups:", path)
+              present = [k for k in KEYS if k in ent]
+              if not present:
+                  print("nothing to strip:", path)
                   continue
-              ent.pop(KEY)
+              for k in present:
+                  ent.pop(k)
+              print("removing", present)
               with tempfile.NamedTemporaryFile(suffix=".plist", delete=False) as t:
                   plistlib.dump(ent, t)
               # ad-hoc re-sign ("-"): needs no certificate or keychain
@@ -275,6 +292,13 @@ jobs:
               print("devices in profile:", len(devs), "| your UDID included:", UDID in devs)
               granted = pr.get("Entitlements", {})
               print("entitlements NOT granted by profile:", sorted(k for k in e if k not in granted) or "none")
+              import tempfile
+              d = tempfile.mkdtemp()
+              subprocess.run(["codesign", "-d", "--extract-certificates=" + d + "/c", exe], capture_output=True)
+              lf = d + "/c0"
+              leaf = open(lf, "rb").read() if os.path.exists(lf) else None
+              certs = [bytes(c) for c in pr.get("DeveloperCertificates", [])]
+              print("signing cert found:", leaf is not None, "| signing cert IN profile:", (leaf in certs) if leaf else "unknown", "| profile certs:", len(certs))
               print("profile entitlement keys:", sorted(granted))
 
               def uncovered(vals, allowed):
