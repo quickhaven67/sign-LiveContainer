@@ -1,0 +1,412 @@
+name: Sign LiveContainer OTA (EAS Credentials)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "Direct URL to source LiveContainer+SideStore.ipa"
+        required: false
+        default: "https://github.com/LiveContainer/LiveContainer/releases/download/nightly/LiveContainer+SideStore.ipa"
+      strip_extensions:
+        description: "Remove app extensions (PlugIns) to match a single-app Ad Hoc profile"
+        required: false
+        type: boolean
+        default: true
+      debug_upterm:
+        description: "Open upterm SSH session on failure"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  sign-and-publish:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      GIST_ID: a780f323dcc1db7243c296f4997f43e9
+      UDID: 00008130-0014442622DB803A
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install tools and helper scripts
+        run: |
+          brew install jq tmux || true
+          brew install owenthereal/upterm/upterm
+          mkdir -p "$HOME/bin" "$HOME/.ssh" "$HOME/eas-creds" "$HOME/eas-project" build
+          chmod 700 "$HOME/.ssh"
+
+          curl -fsSL -L -o "$HOME/bin/plumesign" "https://github.com/claration/impactor/releases/latest/download/plumesign-macos-universal"
+          chmod +x "$HOME/bin/plumesign"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/plumesign" --help >/dev/null
+
+          npm install -g eas-cli
+          eas --version
+          upterm version
+
+          cat > "$HOME/bin/start_upterm.sh" <<'UPTERM_SH'
+          #!/usr/bin/env bash
+          set -e
+          export PATH="$HOME/bin:$PATH"
+          HINT="${1:-Session ready.}"
+          TIMEOUT="${UPTERM_TIMEOUT:-1800}"
+
+          tmux kill-session -t upterm-wrapper 2>/dev/null || true
+          tmux new-session -d -s upterm-wrapper -x 200 -y 50 \
+            "upterm host --accept --skip-host-key-check ${UPTERM_ARGS:-} -- bash -l"
+
+          SSH_CMD=""
+          for _ in $(seq 1 60); do
+            SSH_CMD=$(tmux capture-pane -p -J -S -300 -t upterm-wrapper 2>/dev/null | grep -Eo 'ssh [A-Za-z0-9._@:-]+@[^[:space:]]+' | head -n 1 || true)
+            if [ -z "$SSH_CMD" ]; then
+              SSH_CMD=$(upterm session current 2>/dev/null | grep -Eo 'ssh [A-Za-z0-9._@:-]+@[^[:space:]]+' | head -n 1 || true)
+            fi
+            [ -n "$SSH_CMD" ] && break
+            sleep 1
+          done
+
+          if [ -z "$SSH_CMD" ]; then
+            echo "Could not get SSH command from upterm. tmux screen:"
+            tmux capture-pane -p -t upterm-wrapper 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "UPTERM_SSH=$SSH_CMD"
+
+          if [ -n "${GIST_TOKEN:-}" ]; then
+            SSH_CMD="$SSH_CMD" HINT="$HINT" python3 - <<'PY' || echo "Gist update failed (continuing)"
+          import json, os, urllib.request
+
+          content = "\n".join([
+              "run " + os.environ.get("GITHUB_RUN_ID", "?"),
+              os.environ["HINT"],
+              os.environ["SSH_CMD"],
+              "",
+          ])
+          body = json.dumps({"files": {"upterm_ssh.txt": {"content": content}}}).encode("utf-8")
+          req = urllib.request.Request(
+              "https://api.github.com/gists/" + os.environ["GIST_ID"],
+              data=body,
+              method="PATCH",
+              headers={
+                  "Authorization": "Bearer " + os.environ["GIST_TOKEN"],
+                  "Content-Type": "application/json",
+                  "User-Agent": "github-actions",
+              },
+          )
+          urllib.request.urlopen(req, timeout=20).read()
+          print("SSH command published to Gist")
+          PY
+          fi
+
+          DEADLINE=$((SECONDS + TIMEOUT))
+          while tmux has-session -t upterm-wrapper 2>/dev/null; do
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "upterm session timed out"
+              tmux kill-session -t upterm-wrapper 2>/dev/null || true
+              break
+            fi
+            sleep 5
+          done
+          UPTERM_SH
+
+          cat > "$HOME/get_creds.sh" <<'CREDS_SH'
+          #!/usr/bin/env bash
+          set -e
+          export PATH="$HOME/bin:$PATH"
+          mkdir -p "$HOME/eas-project" "$HOME/eas-creds"
+          cd "$HOME/eas-project"
+          git init -q 2>/dev/null || true
+
+          if [ -z "${EXPO_TOKEN:-}" ]; then
+            echo "== Log in to Expo =="
+            eas login
+          fi
+
+          echo
+          read -r -p "Expo account (owner) username: " OWNER
+          read -r -p "Project slug: " SLUG
+          read -r -p "Project ID (uuid): " PID
+          read -r -p "iOS bundle identifier: " BID
+
+          printf '{"name":"%s","version":"1.0.0"}\n' "$SLUG" > package.json
+          cat > app.json <<JSON
+          {
+            "expo": {
+              "name": "$SLUG",
+              "slug": "$SLUG",
+              "owner": "$OWNER",
+              "version": "1.0.0",
+              "ios": { "bundleIdentifier": "$BID" },
+              "extra": { "eas": { "projectId": "$PID" } }
+            }
+          }
+          JSON
+          printf '{"build":{"preview":{"distribution":"internal"},"production":{}}}\n' > eas.json
+
+          echo
+          echo "Pick: iOS -> your build profile -> 'credentials.json: Upload/Download'"
+          echo "-> 'Download credentials from EAS to credentials.json'. Then quit."
+          eas credentials --platform ios
+
+          if [ ! -f credentials.json ]; then
+            echo "credentials.json was not created. Run ~/get_creds.sh again."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json, os, shutil
+
+          data = json.load(open("credentials.json", encoding="utf-8"))
+          ios = data.get("ios", data)
+          dest = os.path.expanduser("~/eas-creds")
+          shutil.copy(ios["provisioningProfilePath"], os.path.join(dest, "profile.mobileprovision"))
+          shutil.copy(ios["distributionCertificate"]["path"], os.path.join(dest, "dist.p12"))
+          with open(os.path.join(dest, "p12pass"), "w", encoding="utf-8") as f:
+              f.write(ios["distributionCertificate"]["password"])
+          print("Copied profile.mobileprovision, dist.p12, and p12pass")
+          PY
+
+          cd "$HOME/eas-creds"
+          for O in openssl /opt/homebrew/bin/openssl /usr/local/bin/openssl; do
+            command -v "$O" >/dev/null 2>&1 || continue
+            for L in "" "-legacy"; do
+              if "$O" pkcs12 $L -in dist.p12 -passin file:p12pass -nodes -nocerts -out key.raw 2>/dev/null \
+                 && "$O" pkcs12 $L -in dist.p12 -passin file:p12pass -nokeys -clcerts -out cert.raw 2>/dev/null; then
+                break 2
+              fi
+            done
+          done
+
+          sed -n '/-----BEGIN/,/-----END/p' key.raw > key.pem
+          sed -n '/-----BEGIN/,/-----END/p' cert.raw > cert.pem
+          rm -f key.raw cert.raw
+
+          if [ -s key.pem ] && [ -s cert.pem ] && [ -s profile.mobileprovision ]; then
+            echo "OK: key.pem, cert.pem, and profile.mobileprovision are ready. Type 'exit' to continue."
+          else
+            echo "ERROR: Missing or empty credential outputs."
+            exit 1
+          fi
+          CREDS_SH
+
+          chmod +x "$HOME/bin/start_upterm.sh" "$HOME/get_creds.sh"
+
+      - name: Restore saved credentials
+        uses: actions/cache/restore@v4
+        with:
+          path: creds.enc
+          key: eas-creds-v1
+          restore-keys: |
+            eas-creds-
+
+      - name: Check saved credentials
+        id: creds
+        env:
+          SESSION_KEY: ${{ secrets.SESSION_KEY || secrets.GIST_TOKEN }}
+        run: |
+          ok=false
+          if [ -f creds.enc ] && [ -n "$SESSION_KEY" ]; then
+            if openssl enc -d -aes-256-cbc -pbkdf2 -pass env:SESSION_KEY -in creds.enc | tar -xz -C "$HOME"; then
+              if [ -s "$HOME/eas-creds/key.pem" ] && [ -s "$HOME/eas-creds/cert.pem" ] && [ -s "$HOME/eas-creds/profile.mobileprovision" ]; then
+                ok=true
+              fi
+            fi
+          fi
+          echo "Saved credentials usable: $ok"
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+
+      - name: Open SSH to pull EAS credentials
+        if: steps.creds.outputs.ok != 'true'
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          "$HOME/bin/start_upterm.sh" "Run ~/get_creds.sh to pull EAS credentials, then type exit to continue."
+
+      - name: Validate provisioning profile and derive bundle ID
+        run: |
+          python3 - <<'PY'
+          import os, plistlib, ssl, subprocess, sys
+
+          home = os.path.expanduser("~")
+          r = subprocess.run(
+              ["security", "cms", "-D", "-i", os.path.join(home, "eas-creds", "profile.mobileprovision")],
+              capture_output=True,
+              check=True,
+          )
+          prof = plistlib.loads(r.stdout)
+          ents = prof.get("Entitlements", {})
+          team = prof["TeamIdentifier"][0]
+          app_id = ents.get("application-identifier", "")
+          raw_bid = app_id[len(team) + 1:] if app_id.startswith(team + ".") else app_id
+
+          devs = [d.lower() for d in prof.get("ProvisionedDevices", [])]
+          udid = os.environ["UDID"].lower()
+          udid_ok = bool(prof.get("ProvisionsAllDevices")) or (udid in devs)
+
+          cert_pem = open(os.path.join(home, "eas-creds", "cert.pem"), encoding="utf-8").read()
+          cert_der = ssl.PEM_cert_to_DER_cert(cert_pem)
+          prof_certs = [bytes(c) for c in prof.get("DeveloperCertificates", [])]
+          cert_ok = cert_der in prof_certs
+
+          final_bid = (raw_bid[:-1] + "livecontainer") if raw_bid.endswith("*") else raw_bid
+          print("Profile:", prof.get("Name"), "| Team:", team, "| Expires:", prof.get("ExpirationDate"))
+          print("Provisioned App ID:", raw_bid, "| Target Bundle ID:", final_bid)
+          print("UDID included:", udid_ok, "| Cert matches profile:", cert_ok)
+
+          problems = []
+          if not udid_ok:
+              problems.append(f"UDID {udid} not in profile")
+          if not cert_ok:
+              problems.append("certificate does not match profile")
+          if problems:
+              print("ERROR:", "; ".join(problems))
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"BUNDLE_ID={final_bid}\n")
+          PY
+
+      - name: Download source IPA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_IPA_URL: ${{ inputs.ipa_url }}
+        run: |
+          mkdir -p build
+          if [ -n "$INPUT_IPA_URL" ]; then
+            curl -fsSL -L -o build/source.ipa "$INPUT_IPA_URL"
+          else
+            ASSET_API_URL=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=10" | jq -r '[.[].assets[] | select(.name | test("LiveContainer.*\\.ipa$"; "i")) | select(.name | test("signed|fixed"; "i") | not)][0].url // empty')
+            if [ -z "$ASSET_API_URL" ]; then
+              echo "::error::No matching LiveContainer IPA asset found in recent releases."
+              exit 1
+            fi
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o build/source.ipa "$ASSET_API_URL"
+          fi
+          ls -lh build/source.ipa
+
+      - name: Prepare IPA for signing
+        env:
+          STRIP_EXTS: ${{ inputs.strip_extensions }}
+        run: |
+          rm -rf build/pre && mkdir -p build/pre
+          unzip -q build/source.ipa -d build/pre
+          APP=$(find build/pre/Payload -maxdepth 1 -name "*.app" | head -n 1)
+          if [ -z "$APP" ]; then
+            echo "::error::No .app found inside source IPA"
+            exit 1
+          fi
+          if [ "$STRIP_EXTS" = "true" ]; then
+            rm -rf "$APP/PlugIns"
+          fi
+          EXE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
+          EXE_PATH="$APP/$EXE_NAME"
+          printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict/></plist>\n' > build/empty.plist
+          codesign -f -s - --entitlements build/empty.plist --timestamp=none "$EXE_PATH"
+          (cd build/pre && zip -qry ../prepared.ipa Payload)
+          ls -lh build/prepared.ipa
+
+      - name: Sign IPA with plumesign
+        run: |
+          plumesign sign \
+            --package build/prepared.ipa \
+            --pem "$HOME/eas-creds/cert.pem" "$HOME/eas-creds/key.pem" \
+            --provision "$HOME/eas-creds/profile.mobileprovision" \
+            --custom-identifier "$BUNDLE_ID" \
+            --output build/LiveContainer+SideStore-signed.ipa
+          ls -lh build/LiveContainer+SideStore-signed.ipa
+
+      - name: Host IPA and update Gist manifest
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "${GIST_TOKEN:-}" ]; then
+            echo "::error::GIST_TOKEN is required to update manifest.plist"
+            exit 1
+          fi
+          TAG="signed-$(date +%s)"
+          cp build/LiveContainer+SideStore-signed.ipa build/LiveContainer-signed.ipa
+          gh release create "$TAG" build/LiveContainer-signed.ipa \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes "Automated OTA build ($BUNDLE_ID)" \
+            --prerelease
+          IPA_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/LiveContainer-signed.ipa"
+          echo "IPA_URL=$IPA_URL"
+
+          IPA_URL="$IPA_URL" GIST_TOKEN="$GIST_TOKEN" GIST_ID="$GIST_ID" BUNDLE_ID="$BUNDLE_ID" python3 - <<'PY'
+          import json, os, plistlib, urllib.parse, urllib.request
+
+          manifest = {
+              "items": [{
+                  "assets": [{"kind": "software-package", "url": os.environ["IPA_URL"]}],
+                  "metadata": {
+                      "bundle-identifier": os.environ["BUNDLE_ID"],
+                      "bundle-version": "1.0",
+                      "kind": "software",
+                      "title": "LiveContainer",
+                  },
+              }]
+          }
+          body = json.dumps({
+              "files": {
+                  "manifest.plist": {
+                      "content": plistlib.dumps(manifest).decode("utf-8")
+                  }
+              }
+          }).encode("utf-8")
+          req = urllib.request.Request(
+              "https://api.github.com/gists/" + os.environ["GIST_ID"],
+              data=body,
+              method="PATCH",
+              headers={
+                  "Authorization": "Bearer " + os.environ["GIST_TOKEN"],
+                  "Content-Type": "application/json",
+                  "User-Agent": "github-actions",
+              },
+          )
+          res = json.loads(urllib.request.urlopen(req, timeout=30).read().decode("utf-8"))
+          raw_url = res["files"]["manifest.plist"]["raw_url"]
+          itms = "itms-services://?action=download-manifest&url=" + urllib.parse.quote(raw_url, safe="")
+          print("GIST_RAW_URL=" + raw_url)
+          print("ITMS_URL=" + itms)
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as s:
+                  s.write(f"### LiveContainer OTA Link\n`{itms}`\n")
+          PY
+
+      - name: Pack and cache credentials
+        if: always()
+        id: pack
+        env:
+          SESSION_KEY: ${{ secrets.SESSION_KEY || secrets.GIST_TOKEN }}
+        run: |
+          if [ -s "$HOME/eas-creds/key.pem" ] && [ -s "$HOME/eas-creds/cert.pem" ] && [ -s "$HOME/eas-creds/profile.mobileprovision" ] && [ -n "${SESSION_KEY:-}" ]; then
+            tar -cz -C "$HOME" eas-creds | openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:SESSION_KEY -out creds.enc
+            echo "packed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "packed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save credentials cache
+        if: always() && steps.pack.outputs.packed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: creds.enc
+          key: eas-creds-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Open upterm on failure
+        if: failure() && inputs.debug_upterm
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          if [ -x "$HOME/bin/start_upterm.sh" ]; then
+            "$HOME/bin/start_upterm.sh" "A step failed. Inspect in SSH, then type exit."
+          fi
