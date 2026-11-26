@@ -32,7 +32,7 @@ jobs:
         run: |
           brew update
           brew install franklintra/tap/splice openssl@3 jq
-          splice --version
+          splice --help
 
       - name: Download latest LiveContainer IPA from GitHub Releases
         env:
