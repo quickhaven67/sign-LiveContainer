@@ -31,7 +31,9 @@ jobs:
           brew install owenthereal/upterm/upterm
           mkdir -p "$HOME/bin" "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
-          [ -f "$HOME/.ssh/id_ed25519" ] || ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
+          if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
+            ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
+          fi
           curl -fsSL -L -o "$HOME/bin/plumesign" "https://github.com/claration/impactor/releases/latest/download/plumesign-macos-universal"
           chmod +x "$HOME/bin/plumesign"
           echo "$HOME/bin" >> "$GITHUB_PATH"
@@ -47,15 +49,11 @@ jobs:
         run: |
           CLEAN_ID=$(printf '%s' "$APPLE_ID" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
           CLEAN_PW=$(printf '%s' "$APPLE_PASSWORD" | tr -d '\r\n')
-          cat <<EOF > "$HOME/login_apple.sh"
-#!/usr/bin/env bash
-set -e
-export PATH="$HOME/bin:\$PATH"
-plumesign account login --username "$CLEAN_ID" --password "$CLEAN_PW"
-EOF
+          printf '#!/usr/bin/env bash\nset -e\nexport PATH="%s/bin:$PATH"\nplumesign account login --username "%s" --password "%s"\n' "$HOME" "$CLEAN_ID" "$CLEAN_PW" > "$HOME/login_apple.sh"
           chmod +x "$HOME/login_apple.sh"
 
-          upterm host --accept-host-key --force-command "bash -l" >/tmp/upterm.log 2>&1 &
+          : > /tmp/upterm.log
+          upterm host --accept-host-key --force-command "bash -l" > /tmp/upterm.log 2>&1 &
           UPTERM_PID=$!
 
           SSH_CMD=""
@@ -67,7 +65,9 @@ EOF
             if [ -z "$SSH_CMD" ]; then
               SSH_CMD=$(grep -Eo 'ssh [A-Za-z0-9._@-]+@[^[:space:]]+' /tmp/upterm.log 2>/dev/null | head -n 1 || true)
             fi
-            [ -n "$SSH_CMD" ] && break
+            if [ -n "$SSH_CMD" ]; then
+              break
+            fi
             sleep 1
           done
 
@@ -79,13 +79,13 @@ EOF
 
           echo "UPTERM_SSH=$SSH_CMD"
           if [ -n "$GIST_TOKEN" ]; then
-            SSH_CMD="$SSH_CMD" GIST_TOKEN="$GIST_TOKEN" python3 - <<'PY'
+            SSH_CMD="$SSH_CMD" GIST_TOKEN="$GIST_TOKEN" python3 -c '
 import json, os, urllib.request
 
 payload = json.dumps({
     "files": {
         "upterm_ssh.txt": {
-            "content": f"Run in SSH: ~/login_apple.sh\nThen exit SSH to continue.\n{os.environ['SSH_CMD']}\n"
+            "content": f"Run in SSH: ~/login_apple.sh\nThen exit SSH to continue.\n{os.environ[\"SSH_CMD\"]}\n"
         }
     }
 }).encode("utf-8")
@@ -94,13 +94,13 @@ req = urllib.request.Request(
     data=payload,
     method="PATCH",
     headers={
-        "Authorization": f"Bearer {os.environ['GIST_TOKEN']}",
+        "Authorization": f"Bearer {os.environ[\"GIST_TOKEN\"]}",
         "Content-Type": "application/json",
         "User-Agent": "github-actions",
     },
 )
 urllib.request.urlopen(req, timeout=20).read()
-PY
+'
           fi
 
           wait "$UPTERM_PID" || true
@@ -124,7 +124,9 @@ PY
             curl -fsSL -o build/source.ipa "$INPUT_IPA_URL"
           else
             ASSET_URL=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 5 --json tagName,assets --jq '[.[] | .assets[]? | select(.name | test("LiveContainer.*\\.ipa$"; "i")) | select(.name | test("signed|fixed"; "i") | not)][0].url')
-            [ -z "$ASSET_URL" ] && ASSET_URL=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 5 --json assets --jq '[.[] | .assets[]?][0].url')
+            if [ -z "$ASSET_URL" ]; then
+              ASSET_URL=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 5 --json assets --jq '[.[] | .assets[]?][0].url')
+            fi
             curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o build/source.ipa "$ASSET_URL"
           fi
           ls -lh build/source.ipa
@@ -143,7 +145,7 @@ PY
           unzip -q build/LiveContainer+SideStore-signed.ipa -d build/resign
           CERT=$(security find-identity -v -p codesigning | awk '/Dennis Lawson/{print $2; exit}')
           export CERT
-          python3 - <<'PY'
+          python3 -c '
 import glob, os, plistlib, re, subprocess
 
 bins = sorted(
@@ -169,10 +171,12 @@ for p in bins:
                 check=False,
             )
             break
-PY
+'
           find build/resign/Payload/LiveContainer.app -depth \( -name "*.dylib" -o -name "*.framework" -o -name "*.appex" \) -exec codesign -f -s "$CERT" --timestamp=none {} + 2>/dev/null || true
           MAIN_ENT="build/resign/Payload/LiveContainer.app/LiveContainer.entitlements.plist"
-          [ -f "$MAIN_ENT" ] && codesign -f -s "$CERT" --entitlements "$MAIN_ENT" --timestamp=none build/resign/Payload/LiveContainer.app || true
+          if [ -f "$MAIN_ENT" ]; then
+            codesign -f -s "$CERT" --entitlements "$MAIN_ENT" --timestamp=none build/resign/Payload/LiveContainer.app || true
+          fi
           (cd build/resign && zip -qry ../final.ipa Payload) && mv build/final.ipa build/LiveContainer+SideStore-signed.ipa
           ls -lh build/LiveContainer+SideStore-signed.ipa
 
@@ -188,7 +192,7 @@ PY
             IPA_URL=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[0].browserDownloadUrl')
           fi
           echo "IPA_URL=$IPA_URL"
-          IPA_URL="$IPA_URL" GIST_TOKEN="$GIST_TOKEN" python3 - <<'PY'
+          IPA_URL="$IPA_URL" GIST_TOKEN="$GIST_TOKEN" python3 -c '
 import json, os, urllib.parse, urllib.request
 
 ipa_url = os.environ["IPA_URL"]
@@ -216,12 +220,14 @@ if gist_token:
     print("ITMS_URL=" + itms_url)
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
         s.write(f"### LiveContainer OTA Link\n`{itms_url}`\n")
-PY
+'
 
       - name: Start upterm on failure if requested
         if: failure() && inputs.debug_upterm
         run: |
           brew install owenthereal/upterm/upterm || true
           mkdir -p "$HOME/.ssh"
-          [ -f "$HOME/.ssh/id_ed25519" ] || ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
+          if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
+            ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
+          fi
           upterm host --accept-host-key --force-command "bash -l"
