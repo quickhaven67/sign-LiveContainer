@@ -4,30 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: "Direct URL to source LiveContainer+SideStore.ipa (blank = newest matching asset in this repo's releases)"
+        description: "Direct URL to source LiveContainer+SideStore.ipa"
         required: false
         default: "https://github.com/LiveContainer/LiveContainer/releases/download/nightly/LiveContainer+SideStore.ipa"
-      ssh_before_auth:
-        description: "Open upterm SSH session before running Apple authentication"
-        required: false
-        type: boolean
-        default: true
-      bundle_id:
-        description: "Signed bundle ID. Changing it creates 5 NEW App IDs (free accounts: max 10 per 7 days). Leave default normally."
-        required: false
-        default: "com.kdt.livecontainer.V9CQYDJ2NX.v2"
-      strip_restricted:
-        description: "Also strip HealthKit + increased-memory-limit entitlements before signing"
+      strip_extensions:
+        description: "Remove app extensions (PlugIns) to match a single-app Ad Hoc profile"
         required: false
         type: boolean
         default: true
       debug_upterm:
-        description: "Open upterm SSH session on failure"
+        description: "Open upterm SSH session on failure or if profile.mobileprovision is missing"
         required: false
         type: boolean
         default: true
 
-# needed for the `gh release create` fallback
 permissions:
   contents: write
 
@@ -37,52 +27,48 @@ jobs:
     timeout-minutes: 60
     env:
       GIST_ID: a780f323dcc1db7243c296f4997f43e9
-      BUNDLE_ID: ${{ inputs.bundle_id || 'com.kdt.livecontainer.V9CQYDJ2NX.v2' }}
-      TEAM_ID: V9CQYDJ2NX
       UDID: 00008130-0014442622DB803A
+      DEFAULT_P12_PASS: 9A1kMPcZvtSxo5trT2eaUQ==
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install tools and helper scripts
+      - name: Install tools and upterm helper
         run: |
           brew install jq tmux || true
           brew install owenthereal/upterm/upterm
-          mkdir -p "$HOME/bin" "$HOME/.ssh"
+          mkdir -p "$HOME/bin" "$HOME/.ssh" "$HOME/eas-creds" build
           chmod 700 "$HOME/.ssh"
           [ -f "$HOME/.ssh/id_ed25519" ] || ssh-keygen -q -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
 
-          curl -fsSL -o "$HOME/bin/plumesign" "https://github.com/claration/impactor/releases/latest/download/plumesign-macos-universal"
+          curl -fsSL -L -o "$HOME/bin/plumesign" "https://github.com/claration/impactor/releases/latest/download/plumesign-macos-universal"
           chmod +x "$HOME/bin/plumesign"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           "$HOME/bin/plumesign" --help >/dev/null
-          upterm version
 
-          # ---- helper: start upterm (with a TTY via tmux), publish SSH cmd to Gist, wait ----
           cat > "$HOME/bin/start_upterm.sh" <<'UPTERM_SH'
           #!/usr/bin/env bash
+          set -e
           export PATH="$HOME/bin:$PATH"
           HINT="${1:-Session ready.}"
           TIMEOUT="${UPTERM_TIMEOUT:-1800}"
 
-          tmux kill-session -t upterm-wrapper 2>/dev/null
-          # upterm needs a TTY; a detached tmux session provides one
+          tmux kill-session -t upterm-wrapper 2>/dev/null || true
           tmux new-session -d -s upterm-wrapper -x 200 -y 50 \
             "upterm host --accept --skip-host-key-check ${UPTERM_ARGS:-} -- bash -l"
 
           SSH_CMD=""
           for _ in $(seq 1 60); do
-            # upterm prints the session banner to the wrapper's screen, so read it from there
-            SSH_CMD=$(tmux capture-pane -p -J -S -300 -t upterm-wrapper 2>/dev/null | grep -Eo 'ssh [A-Za-z0-9._@:-]+@[^[:space:]]+' | head -n 1)
+            SSH_CMD=$(tmux capture-pane -p -J -S -300 -t upterm-wrapper 2>/dev/null | grep -Eo 'ssh [A-Za-z0-9._@:-]+@[^[:space:]]+' | head -n 1 || true)
             if [ -z "$SSH_CMD" ]; then
-              SSH_CMD=$(upterm session current 2>/dev/null | grep -Eo 'ssh [A-Za-z0-9._@:-]+@[^[:space:]]+' | head -n 1)
+              SSH_CMD=$(upterm session current 2>/dev/null | grep -Eo 'ssh [A-Za-z0-9._@:-]+@[^[:space:]]+' | head -n 1 || true)
             fi
             [ -n "$SSH_CMD" ] && break
             sleep 1
           done
 
           if [ -z "$SSH_CMD" ]; then
-            echo "Could not get SSH command from upterm. tmux screen:"
+            echo "Could not get SSH command from upterm."
             tmux capture-pane -p -t upterm-wrapper 2>/dev/null || true
             exit 1
           fi
@@ -99,7 +85,7 @@ jobs:
               os.environ["SSH_CMD"],
               "",
           ])
-          body = json.dumps({"files": {"upterm_ssh.txt": {"content": content}}}).encode()
+          body = json.dumps({"files": {"upterm_ssh.txt": {"content": content}}}).encode("utf-8")
           req = urllib.request.Request(
               "https://api.github.com/gists/" + os.environ["GIST_ID"],
               data=body,
@@ -115,69 +101,193 @@ jobs:
           PY
           fi
 
-          # block until the shell exits ("exit") or we time out
           DEADLINE=$((SECONDS + TIMEOUT))
           while tmux has-session -t upterm-wrapper 2>/dev/null; do
             if [ "$SECONDS" -ge "$DEADLINE" ]; then
               echo "upterm session timed out"
-              tmux kill-session -t upterm-wrapper 2>/dev/null
+              tmux kill-session -t upterm-wrapper 2>/dev/null || true
               break
             fi
             sleep 5
           done
           UPTERM_SH
 
-          # ---- helper: run inside the SSH shell to log in (reads secrets from env) ----
-          cat > "$HOME/login_apple.sh" <<'LOGIN_SH'
-          #!/usr/bin/env bash
-          export PATH="$HOME/bin:$PATH"
-          ID=$(printf '%s' "$APPLE_ID" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-          PW=$(printf '%s' "$APPLE_PASSWORD" | tr -d '\r\n')
-          touch /tmp/before_login
-          plumesign account login --username "$ID" --password "$PW" || exit 1
-          echo
-          echo "== Files created/changed by login (session storage) =="
-          find "$HOME" /Users/runner/Library /tmp -newer /tmp/before_login -type f \
-            -not -path "*/.ssh/*" -not -path "$HOME/bin/*" -not -path "*/upterm*" \
-            -not -name before_login 2>/dev/null | head -50
-          echo "== end =="
+          chmod +x "$HOME/bin/start_upterm.sh"
 
-          # Interactive (SSH) only: check this phone is registered on the account
-          if [ -t 0 ] && [ -n "$UDID" ]; then
-            echo
-            echo "Checking whether $UDID is registered on this account..."
-            script -q /tmp/devices.txt plumesign account devices
-            if grep -qi "$UDID" /tmp/devices.txt; then
-              echo "OK: $UDID is registered."
-            else
-              echo "UDID not found in the list above. If your iPhone is listed by name, you're fine."
-              read -r -p "Otherwise, register $UDID now? [y/N] " ANS
-              if [ "$ANS" = "y" ]; then
-                plumesign account register-device --udid "$UDID" --name "iPhone"
-              fi
-            fi
-          fi
-          LOGIN_SH
-
-          chmod +x "$HOME/bin/start_upterm.sh" "$HOME/login_apple.sh"
-
-      - name: Show plumesign options (diagnostics only)
-        continue-on-error: true
+      - name: Load certificate, private key, and provisioning profile from repo
+        env:
+          P12_SECRET_PASS: ${{ secrets.P12_PASSWORD }}
         run: |
-          {
-            echo "### plumesign sign --help"
-            echo '```'
-            plumesign sign --help 2>&1
-            echo '```'
-            echo "### plumesign --help"
-            echo '```'
-            plumesign --help 2>&1
-            echo '```'
-            echo "### plumesign account --help"
-            echo '```'
-            plumesign account --help 2>&1
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import glob, os, re, shutil, subprocess
+
+          repo = os.getcwd()
+          dest = os.path.expanduser("~/eas-creds")
+          os.makedirs(dest, exist_ok=True)
+
+          def find_file(candidates):
+              for c in candidates:
+                  p = os.path.join(repo, c)
+                  if os.path.isfile(p):
+                      return p
+              return None
+
+          p12_path = find_file([
+              "DistCert_29YANGQ2GJ.p12",
+              "certs/DistCert_29YANGQ2GJ.p12",
+          ]) or (glob.glob("DistCert_*.p12") + glob.glob("certs/DistCert_*.p12") or [None])[0]
+
+          key_txt_path = find_file([
+              "DistCertPrivateKey_29YANGQ2GJ.txt",
+              "certs/DistCertPrivateKey_29YANGQ2GJ.txt",
+          ]) or (glob.glob("DistCertPrivateKey_*.txt") + glob.glob("certs/DistCertPrivateKey_*.txt") or [None])[0]
+
+          md_path = find_file([
+              "DistCertCredentials_29YANGQ2GJ.md",
+              "certs/DistCertCredentials_29YANGQ2GJ.md",
+          ]) or (glob.glob("DistCertCredentials_*.md") + glob.glob("certs/DistCertCredentials_*.md") or [None])[0]
+
+          prov_path = find_file([
+              "profile.mobileprovision",
+              "certs/profile.mobileprovision",
+          ]) or (glob.glob("*.mobileprovision") + glob.glob("certs/*.mobileprovision") or [None])[0]
+
+          if not p12_path:
+              raise SystemExit("ERROR: DistCert_29YANGQ2GJ.p12 not found in repo.")
+
+          password = os.environ.get("P12_SECRET_PASS", "").strip()
+          if not password and md_path:
+              md_text = open(md_path, encoding="utf-8").read()
+              m = re.search(r"password:\s*`?([^\s`]+)`?", md_text, re.I)
+              if m:
+                  password = m.group(1).strip()
+          if not password:
+              password = os.environ["DEFAULT_P12_PASS"]
+
+          shutil.copy(p12_path, os.path.join(dest, "dist.p12"))
+          with open(os.path.join(dest, "p12pass"), "w", encoding="utf-8") as f:
+              f.write(password)
+
+          cert_pem_path = os.path.join(dest, "cert.pem")
+          key_pem_path = os.path.join(dest, "key.pem")
+
+          cert_extracted = False
+          for openssl_bin in ("openssl", "/opt/homebrew/bin/openssl", "/usr/local/bin/openssl"):
+              if not shutil.which(openssl_bin):
+                  continue
+              for legacy in ([], ["-legacy"]):
+                  res = subprocess.run(
+                      [openssl_bin, "pkcs12", *legacy, "-in", os.path.join(dest, "dist.p12"),
+                       "-passin", f"file:{os.path.join(dest, 'p12pass')}", "-nokeys", "-clcerts"],
+                      capture_output=True, text=True
+                  )
+                  if res.returncode == 0 and "-----BEGIN CERTIFICATE-----" in res.stdout:
+                      blocks = re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", res.stdout, re.S)
+                      with open(cert_pem_path, "w", encoding="utf-8") as f:
+                          f.write("\n".join(blocks) + "\n")
+                      cert_extracted = True
+                      break
+              if cert_extracted:
+                  break
+
+          if not cert_extracted:
+              raise SystemExit("ERROR: Failed to extract certificate PEM from .p12.")
+
+          if key_txt_path:
+              key_raw = open(key_txt_path, encoding="utf-8").read()
+              m_key = re.search(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", key_raw, re.S)
+              if m_key:
+                  with open(key_pem_path, "w", encoding="utf-8") as f:
+                      f.write(m_key.group(0).strip() + "\n")
+
+          if not os.path.isfile(key_pem_path) or os.path.getsize(key_pem_path) == 0:
+              for openssl_bin in ("openssl", "/opt/homebrew/bin/openssl", "/usr/local/bin/openssl"):
+                  if not shutil.which(openssl_bin):
+                      continue
+                  for legacy in ([], ["-legacy"]):
+                      res = subprocess.run(
+                          [openssl_bin, "pkcs12", *legacy, "-in", os.path.join(dest, "dist.p12"),
+                           "-passin", f"file:{os.path.join(dest, 'p12pass')}", "-nodes", "-nocerts"],
+                          capture_output=True, text=True
+                      )
+                      if res.returncode == 0 and "-----BEGIN" in res.stdout:
+                          m_k = re.search(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", res.stdout, re.S)
+                          if m_k:
+                              with open(key_pem_path, "w", encoding="utf-8") as f:
+                                  f.write(m_k.group(0).strip() + "\n")
+                              break
+                  if os.path.isfile(key_pem_path) and os.path.getsize(key_pem_path) > 0:
+                      break
+
+          if not os.path.isfile(key_pem_path) or os.path.getsize(key_pem_path) == 0:
+              raise SystemExit("ERROR: Failed to prepare private key PEM.")
+
+          if prov_path:
+              shutil.copy(prov_path, os.path.join(dest, "profile.mobileprovision"))
+              print("Loaded profile:", prov_path)
+          else:
+              print("WARNING: No .mobileprovision file found in repository.")
+
+          print("Prepared cert.pem and key.pem successfully.")
+          PY
+
+      - name: Open SSH if profile.mobileprovision is missing
+        if: inputs.debug_upterm
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          if [ ! -s "$HOME/eas-creds/profile.mobileprovision" ]; then
+            "$HOME/bin/start_upterm.sh" "Place your .mobileprovision at ~/eas-creds/profile.mobileprovision, then type exit."
+          fi
+
+      - name: Validate profile, certificate, and UDID
+        run: |
+          python3 - <<'PY'
+          import os, plistlib, ssl, subprocess, sys
+
+          home = os.path.expanduser("~")
+          prof_file = os.path.join(home, "eas-creds", "profile.mobileprovision")
+          if not os.path.isfile(prof_file) or os.path.getsize(prof_file) == 0:
+              print("ERROR: ~/eas-creds/profile.mobileprovision is missing.")
+              sys.exit(1)
+
+          r = subprocess.run(
+              ["security", "cms", "-D", "-i", prof_file],
+              capture_output=True,
+              check=True,
+          )
+          prof = plistlib.loads(r.stdout)
+          ents = prof.get("Entitlements", {})
+          team = prof["TeamIdentifier"][0]
+          app_id = ents.get("application-identifier", "")
+          raw_bid = app_id[len(team) + 1:] if app_id.startswith(team + ".") else app_id
+
+          devs = [d.lower() for d in prof.get("ProvisionedDevices", [])]
+          udid = os.environ["UDID"].lower()
+          udid_ok = bool(prof.get("ProvisionsAllDevices")) or (udid in devs)
+
+          cert_pem = open(os.path.join(home, "eas-creds", "cert.pem"), encoding="utf-8").read()
+          cert_der = ssl.PEM_cert_to_DER_cert(cert_pem)
+          prof_certs = [bytes(c) for c in prof.get("DeveloperCertificates", [])]
+          cert_ok = cert_der in prof_certs
+
+          final_bid = (raw_bid[:-1] + "livecontainer") if raw_bid.endswith("*") else raw_bid
+          print("Profile:", prof.get("Name"), "| Team:", team, "| Expires:", prof.get("ExpirationDate"))
+          print("Provisioned App ID:", raw_bid, "| Target Bundle ID:", final_bid)
+          print("UDID included:", udid_ok, "| Cert matches profile:", cert_ok)
+
+          problems = []
+          if not udid_ok:
+              problems.append(f"UDID {udid} not in profile")
+          if not cert_ok:
+              problems.append("certificate does not match profile")
+          if problems:
+              print("ERROR:", "; ".join(problems))
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"BUNDLE_ID={final_bid}\n")
+          PY
 
       - name: Download source IPA
         env:
@@ -186,224 +296,69 @@ jobs:
         run: |
           mkdir -p build
           if [ -n "$INPUT_IPA_URL" ]; then
-            curl -fsSL -o build/source.ipa "$INPUT_IPA_URL"
+            curl -fsSL -L -o build/source.ipa "$INPUT_IPA_URL"
           else
-            RELEASES=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=10")
-            ASSET_API_URL=$(printf '%s' "$RELEASES" | jq -r '[.[].assets[] | select(.name | test("LiveContainer.*\\.ipa$"; "i")) | select(.name | test("signed|fixed"; "i") | not)][0].url // empty')
+            ASSET_API_URL=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=10" | jq -r '[.[].assets[] | select(.name | test("LiveContainer.*\\.ipa$"; "i")) | select(.name | test("signed|fixed"; "i") | not)][0].url // empty')
             if [ -z "$ASSET_API_URL" ]; then
-              echo "::error::No LiveContainer IPA found in the last 10 releases. Upload one or pass ipa_url."
+              echo "::error::No matching LiveContainer IPA asset found in recent releases."
               exit 1
             fi
             curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o build/source.ipa "$ASSET_API_URL"
           fi
           ls -lh build/source.ipa
 
-      - name: Strip application-groups from source IPA entitlements
+      - name: Prepare IPA for signing
         env:
-          STRIP_EXTRA: ${{ inputs.strip_restricted }}
+          STRIP_EXTS: ${{ inputs.strip_extensions }}
         run: |
           rm -rf build/pre && mkdir -p build/pre
           unzip -q build/source.ipa -d build/pre
-          python3 - <<'PY'
-          import glob, os, plistlib, subprocess, tempfile
-
-          KEYS = ["com.apple.security.application-groups"]
-          if os.environ.get("STRIP_EXTRA") == "true":
-              KEYS += [
-                  "com.apple.developer.healthkit",
-                  "com.apple.developer.healthkit.access",
-                  "com.apple.developer.healthkit.background-delivery",
-                  "com.apple.developer.kernel.increased-memory-limit",
-              ]
-          app = glob.glob("build/pre/Payload/*.app")[0]
-          bundles = [app] + sorted(glob.glob(app + "/PlugIns/*.appex"))
-          changed = 0
-
-          for b in bundles:
-              with open(b + "/Info.plist", "rb") as f:
-                  exe = plistlib.load(f).get("CFBundleExecutable")
-              if not exe:
-                  continue
-              path = os.path.join(b, exe)
-              r = subprocess.run(["codesign", "-d", "--entitlements", ":-", path], capture_output=True)
-              if not r.stdout.strip():
-                  print("no embedded entitlements:", path)
-                  continue
-              ent = plistlib.loads(r.stdout)
-              present = [k for k in KEYS if k in ent]
-              if not present:
-                  print("nothing to strip:", path)
-                  continue
-              for k in present:
-                  ent.pop(k)
-              print("removing", present)
-              with tempfile.NamedTemporaryFile(suffix=".plist", delete=False) as t:
-                  plistlib.dump(ent, t)
-              # ad-hoc re-sign ("-"): needs no certificate or keychain
-              r = subprocess.run(["codesign", "-f", "-s", "-", "--entitlements", t.name, "--timestamp=none", path])
-              print("stripped app-groups:", path, "-> codesign exit", r.returncode)
-              if r.returncode != 0:
-                  raise SystemExit(1)
-              changed += 1
-
-          print("binaries changed:", changed)
-          PY
-          (cd build/pre && zip -qry ../stripped.ipa Payload)
-          ls -lh build/stripped.ipa
-
-      - name: Restore saved Apple session
-        uses: actions/cache/restore@v4
-        with:
-          path: session.enc
-          key: plume-session-none
-          restore-keys: |
-            plume-session-
-
-      - name: Check saved Apple session
-        id: session
-        env:
-          SESSION_KEY: ${{ secrets.SESSION_KEY || secrets.GIST_TOKEN }}
-        run: |
-          ok=false
-          if [ -f session.enc ] && [ -n "$SESSION_KEY" ]; then
-            mkdir -p "$HOME/.config"
-            if openssl enc -d -aes-256-cbc -pbkdf2 -pass env:SESSION_KEY -in session.enc | tar -x -C "$HOME/.config"; then
-              echo "Restored saved session, testing it against Apple..."
-              if plumesign account devices -t "$TEAM_ID" > /tmp/devs.txt 2>&1; then
-                ok=true
-                echo "Saved session works - skipping SSH login."
-              else
-                echo "Saved session no longer works:"; tail -5 /tmp/devs.txt
-                rm -rf "$HOME/.config/PlumeImpactor"
-              fi
-            else
-              echo "Could not decrypt saved session."
-            fi
-          else
-            echo "No saved session found."
+          APP=$(find build/pre/Payload -maxdepth 1 -name "*.app" | head -n 1)
+          if [ -z "$APP" ]; then
+            echo "::error::No .app found inside source IPA"
+            exit 1
           fi
-          echo "ok=$ok" >> "$GITHUB_OUTPUT"
-
-      - name: Open upterm session before authentication
-        if: inputs.ssh_before_auth && steps.session.outputs.ok != 'true'
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          # Optional lock-down: restrict who can join (see `upterm host --help`),
-          # e.g. UPTERM_ARGS: "--authorized-keys /path/to/keys"
-        run: |
-          "$HOME/bin/start_upterm.sh" "In the SSH session run: ~/login_apple.sh  then type exit to continue."
-
-      - name: Authenticate with Apple Developer account
-        if: ${{ !inputs.ssh_before_auth && steps.session.outputs.ok != 'true' }}
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-        run: |
-          "$HOME/login_apple.sh"
+          if [ "$STRIP_EXTS" = "true" ]; then
+            rm -rf "$APP/PlugIns"
+          fi
+          EXE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
+          EXE_PATH="$APP/$EXE_NAME"
+          printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict/></plist>\n' > build/empty.plist
+          codesign -f -s - --entitlements build/empty.plist --timestamp=none "$EXE_PATH"
+          (cd build/pre && zip -qry ../prepared.ipa Payload)
+          ls -lh build/prepared.ipa
 
       - name: Sign IPA with plumesign
         run: |
           plumesign sign \
-            --package build/stripped.ipa \
-            --apple-id \
+            --package build/prepared.ipa \
+            --pem "$HOME/eas-creds/cert.pem" "$HOME/eas-creds/key.pem" \
+            --provision "$HOME/eas-creds/profile.mobileprovision" \
             --custom-identifier "$BUNDLE_ID" \
             --output build/LiveContainer+SideStore-signed.ipa
-
-      - name: Inspect signed IPA (diagnostics only)
-        continue-on-error: true
-        run: |
-          rm -rf build/inspect && mkdir -p build/inspect
-          unzip -q build/LiveContainer+SideStore-signed.ipa -d build/inspect
-          python3 - <<'PY'
-          import glob, os, plistlib, subprocess
-
-          UDID = os.environ["UDID"].lower()
-          WANT = os.environ["BUNDLE_ID"]
-          app = glob.glob("build/inspect/Payload/*.app")[0]
-
-          def info(b):
-              with open(b + "/Info.plist", "rb") as f:
-                  return plistlib.load(f)
-
-          def ents(path):
-              r = subprocess.run(["codesign", "-d", "--entitlements", ":-", path], capture_output=True)
-              return plistlib.loads(r.stdout) if r.stdout.strip() else {}
-
-          def profile(b):
-              p = b + "/embedded.mobileprovision"
-              if not os.path.exists(p):
-                  return None
-              r = subprocess.run(["security", "cms", "-D", "-i", p], capture_output=True)
-              return plistlib.loads(r.stdout) if r.stdout.strip() else None
-
-          for b in [app] + sorted(glob.glob(app + "/PlugIns/*.appex")):
-              i = info(b)
-              exe = os.path.join(b, i["CFBundleExecutable"])
-              e = ents(exe)
-              print("==", os.path.basename(b))
-              print("bundle id:", i["CFBundleIdentifier"],
-                    "| matches manifest:" , i["CFBundleIdentifier"] == WANT if b == app else "n/a")
-              print("binary entitlements:", sorted(e))
-              pr = profile(b)
-              if pr is None:
-                  print("NO embedded.mobileprovision")
-                  continue
-              devs = [d.lower() for d in pr.get("ProvisionedDevices", [])]
-              print("profile:", pr.get("Name"), "| team:", pr.get("TeamIdentifier"), "| expires:", pr.get("ExpirationDate"))
-              print("devices in profile:", len(devs), "| your UDID included:", UDID in devs)
-              granted = pr.get("Entitlements", {})
-              print("entitlements NOT granted by profile:", sorted(k for k in e if k not in granted) or "none")
-              import tempfile
-              d = tempfile.mkdtemp()
-              subprocess.run(["codesign", "-d", "--extract-certificates=" + d + "/c", exe], capture_output=True)
-              lf = d + "/c0"
-              leaf = open(lf, "rb").read() if os.path.exists(lf) else None
-              certs = [bytes(c) for c in pr.get("DeveloperCertificates", [])]
-              print("signing cert found:", leaf is not None, "| signing cert IN profile:", (leaf in certs) if leaf else "unknown", "| profile certs:", len(certs))
-              print("profile entitlement keys:", sorted(granted))
-
-              def uncovered(vals, allowed):
-                  return [v for v in vals if not any(v == a or (a.endswith("*") and v.startswith(a[:-1])) for a in allowed)]
-
-              for k in ("com.apple.security.application-groups", "keychain-access-groups"):
-                  if k in e:
-                      allowed = granted.get(k, [])
-                      bad = uncovered(e[k], allowed)
-                      print(k, "| binary:", len(e[k]), "items, first:", e[k][:2], "| profile allows:", allowed[:3],
-                            "| binary items NOT covered by profile:", len(bad), bad[:3])
-              for k, v in e.items():
-                  if not isinstance(v, list) and k in granted and granted[k] != v:
-                      print("value differs:", k, "binary =", v, "| profile =", granted[k])
-          PY
-          echo "---- deep codesign verify ----"
-          {
-            echo "### Deep codesign verify"
-            echo '```'
-            codesign --verify --deep --strict --verbose=2 build/inspect/Payload/*.app 2>&1 | tail -30
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          ls -lh build/LiveContainer+SideStore-signed.ipa
 
       - name: Host IPA and update Gist manifest
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          IPA=build/LiveContainer+SideStore-signed.ipa
+          if [ -z "${GIST_TOKEN:-}" ]; then
+            echo "::error::GIST_TOKEN is required to update manifest.plist"
+            exit 1
+          fi
           TAG="signed-$(date +%s)"
-          cp "$IPA" build/LiveContainer-signed.ipa
-          gh release create "$TAG" build/LiveContainer-signed.ipa --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Automated OTA build" --prerelease
+          cp build/LiveContainer+SideStore-signed.ipa build/LiveContainer-signed.ipa
+          gh release create "$TAG" build/LiveContainer-signed.ipa \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes "Automated OTA build ($BUNDLE_ID)" \
+            --prerelease
           IPA_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/LiveContainer-signed.ipa"
           echo "IPA_URL=$IPA_URL"
-          export IPA_URL
 
-          python3 - <<'PY'
+          IPA_URL="$IPA_URL" GIST_TOKEN="$GIST_TOKEN" GIST_ID="$GIST_ID" BUNDLE_ID="$BUNDLE_ID" python3 - <<'PY'
           import json, os, plistlib, urllib.parse, urllib.request
-
-          token = os.environ.get("GIST_TOKEN", "")
-          if not token:
-              raise SystemExit("GIST_TOKEN is not set; cannot update manifest")
 
           manifest = {
               "items": [{
@@ -416,63 +371,39 @@ jobs:
                   },
               }]
           }
-          body = json.dumps({"files": {"manifest.plist": {"content": plistlib.dumps(manifest).decode()}}}).encode()
+          body = json.dumps({
+              "files": {
+                  "manifest.plist": {
+                      "content": plistlib.dumps(manifest).decode("utf-8")
+                  }
+              }
+          }).encode("utf-8")
           req = urllib.request.Request(
               "https://api.github.com/gists/" + os.environ["GIST_ID"],
               data=body,
               method="PATCH",
               headers={
-                  "Authorization": "Bearer " + token,
+                  "Authorization": "Bearer " + os.environ["GIST_TOKEN"],
                   "Content-Type": "application/json",
                   "User-Agent": "github-actions",
               },
           )
-          res = json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
+          res = json.loads(urllib.request.urlopen(req, timeout=30).read().decode("utf-8"))
           raw_url = res["files"]["manifest.plist"]["raw_url"]
           itms = "itms-services://?action=download-manifest&url=" + urllib.parse.quote(raw_url, safe="")
           print("GIST_RAW_URL=" + raw_url)
           print("ITMS_URL=" + itms)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
-              s.write("### LiveContainer OTA Link\n`" + itms + "`\n")
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as s:
+                  s.write(f"### LiveContainer OTA Link\n`{itms}`\n")
           PY
-
-          echo "---- OTA reachability ----"
-          {
-            echo "### OTA reachability"
-            echo '```'
-            echo "IPA:"
-            curl -sL -A "itunesstored" -o /dev/null -w "http=%{http_code} bytes=%{size_download} type=%{content_type} final=%{url_effective}\n" "$IPA_URL"
-            echo "local size: $(stat -f%z "$IPA")"
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Pack Apple session (encrypted)
-        if: always()
-        id: pack
-        env:
-          SESSION_KEY: ${{ secrets.SESSION_KEY || secrets.GIST_TOKEN }}
-        run: |
-          if [ -f "$HOME/.config/PlumeImpactor/accounts.json" ] && [ -n "$SESSION_KEY" ]; then
-            tar -c -C "$HOME/.config" PlumeImpactor | openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:SESSION_KEY -out session.enc
-            echo "packed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "No session to save."
-          fi
-
-      - name: Save Apple session
-        if: always() && steps.pack.outputs.packed == 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: session.enc
-          key: plume-session-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Open upterm on failure
         if: failure() && inputs.debug_upterm
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
         run: |
-          if [ ! -x "$HOME/bin/start_upterm.sh" ]; then
-            echo "Helper script missing (job failed before setup)"
-            exit 1
+          if [ -x "$HOME/bin/start_upterm.sh" ]; then
+            "$HOME/bin/start_upterm.sh" "A step failed. Inspect in SSH, then type exit."
           fi
-          "$HOME/bin/start_upterm.sh" "A step failed. Debug in the SSH session, then type exit."
