@@ -21,7 +21,7 @@ on:
 
 jobs:
   sign-ipa:
-    runs-on: macos-latest # Apple Silicon (arm64) free macOS runner
+    runs-on: macos-latest
     timeout-minutes: 25
 
     steps:
@@ -52,12 +52,17 @@ jobs:
           ls -lh "work/$IPA_VARIANT"
 
       - name: Restore cached Apple GS session & ADI machine state
-        if: ${{ secrets.SPLICE_STATE_B64 != '' }}
+        env:
+          SPLICE_STATE_B64: ${{ secrets.SPLICE_STATE_B64 }}
         run: |
-          mkdir -p "$HOME/Library/Application Support"
-          echo "${{ secrets.SPLICE_STATE_B64 }}" | base64 -d > work/splice_state.tar.gz
-          tar -xzf work/splice_state.tar.gz -C "$HOME/Library/Application Support"
-          echo "Restored cached Splice session and machine identity."
+          if [ -n "$SPLICE_STATE_B64" ]; then
+            mkdir -p "$HOME/Library/Application Support"
+            echo "$SPLICE_STATE_B64" | base64 -d > work/splice_state.tar.gz
+            tar -xzf work/splice_state.tar.gz -C "$HOME/Library/Application Support"
+            echo "Restored cached Splice session and machine identity."
+          else
+            echo "No SPLICE_STATE_B64 secret set yet; skipping state restore."
+          fi
 
       - name: Interactive SSH Session (First-Time 2FA & State Export)
         if: ${{ inputs.interactive_ssh == true }}
@@ -82,36 +87,28 @@ jobs:
             exit 1
           fi
 
-          # 1. Authenticate (uses cached GS token if valid; falls back to credentials)
           splice login --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD"
-
-          # 2. Ensure your iPhone UDID is registered on your Personal Team
           splice device add --udid "$DEVICE_UDID" --name "iPhone-Remote" || true
 
-          # 3. Extract IPA & inspect original Bundle ID so it overwrites your existing app cleanly
           unzip -q "work/$IPA_VARIANT" -d work/extracted
           APP_BUNDLE=$(find work/extracted/Payload -maxdepth 1 -name "*.app" | head -n 1)
           ORIG_BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_BUNDLE/Info.plist")
           TARGET_BUNDLE_ID="${CUSTOM_BUNDLE_ID:-$ORIG_BUNDLE_ID}"
           echo "Target Bundle ID: $TARGET_BUNDLE_ID"
 
-          # 4. Generate Key + CSR & request/fetch Personal Team Development Certificate
           openssl genrsa -out work/privatekey.pem 2048
           openssl req -new -key work/privatekey.pem -out work/csr.csr -subj "/CN=Splice-GHA"
           splice cert request --csr work/csr.csr --out work/dev_cert.cer || splice cert download --out work/dev_cert.cer
 
-          # 5. Register App ID & download matching .mobileprovision for your UDID
           splice app-id add --bundle-id "$TARGET_BUNDLE_ID" --name "LiveContainer" || true
           splice app-id provision --bundle-id "$TARGET_BUNDLE_ID" --out work/profile.mobileprovision
 
-          # 6. Sign the .app bundle (preserves LiveContainer entitlements & nested plugins/SideStore)
           splice sign \
             --cert work/dev_cert.cer \
             --key work/privatekey.pem \
             --provision work/profile.mobileprovision \
             "$APP_BUNDLE"
 
-          # 7. Repackage into clean signed .ipa
           (cd work/extracted && zip -qr "../../output/LiveContainer-Signed.ipa" Payload)
           ls -lh output/LiveContainer-Signed.ipa
 
