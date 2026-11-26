@@ -29,6 +29,7 @@ jobs:
     env:
       GIST_ID: a780f323dcc1db7243c296f4997f43e9
       BUNDLE_ID: com.kdt.livecontainer.V9CQYDJ2NX
+      UDID: 00008130-0014442622DB803A
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -122,7 +123,23 @@ jobs:
           export PATH="$HOME/bin:$PATH"
           ID=$(printf '%s' "$APPLE_ID" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
           PW=$(printf '%s' "$APPLE_PASSWORD" | tr -d '\r\n')
-          plumesign account login --username "$ID" --password "$PW"
+          plumesign account login --username "$ID" --password "$PW" || exit 1
+
+          # Interactive (SSH) only: check this phone is registered on the account
+          if [ -t 0 ] && [ -n "$UDID" ]; then
+            echo
+            echo "Checking whether $UDID is registered on this account..."
+            script -q /tmp/devices.txt plumesign account devices
+            if grep -qi "$UDID" /tmp/devices.txt; then
+              echo "OK: $UDID is registered."
+            else
+              echo "UDID not found in the list above. If your iPhone is listed by name, you're fine."
+              read -r -p "Otherwise, register $UDID now? [y/N] " ANS
+              if [ "$ANS" = "y" ]; then
+                plumesign account register-device --udid "$UDID" --name "iPhone"
+              fi
+            fi
+          fi
           LOGIN_SH
 
           chmod +x "$HOME/bin/start_upterm.sh" "$HOME/login_apple.sh"
