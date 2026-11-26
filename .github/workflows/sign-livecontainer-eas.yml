@@ -1,4 +1,4 @@
-name: Sign LiveContainer OTA (EAS Credentials)
+name: Sign LiveContainer OTA
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: false
         default: "https://github.com/LiveContainer/LiveContainer/releases/download/nightly/LiveContainer+SideStore.ipa"
       strip_extensions:
-        description: "Remove app extensions (PlugIns) to match a single-app Ad Hoc profile"
+        description: "Remove app extensions (PlugIns) to match the single-app Ad Hoc profile"
         required: false
         type: boolean
         default: true
@@ -28,25 +28,23 @@ jobs:
     env:
       GIST_ID: a780f323dcc1db7243c296f4997f43e9
       UDID: 00008130-0014442622DB803A
+      DEFAULT_P12_PASS: Oasis12345
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install tools and helper scripts
+      - name: Install tools and upterm helper
         run: |
           brew install jq tmux || true
           brew install owenthereal/upterm/upterm
-          mkdir -p "$HOME/bin" "$HOME/.ssh" "$HOME/eas-creds" "$HOME/eas-project" build
+          mkdir -p "$HOME/bin" "$HOME/.ssh" "$HOME/eas-creds" build
           chmod 700 "$HOME/.ssh"
+          [ -f "$HOME/.ssh/id_ed25519" ] || ssh-keygen -q -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
 
           curl -fsSL -L -o "$HOME/bin/plumesign" "https://github.com/claration/impactor/releases/latest/download/plumesign-macos-universal"
           chmod +x "$HOME/bin/plumesign"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           "$HOME/bin/plumesign" --help >/dev/null
-
-          npm install -g eas-cli
-          eas --version
-          upterm version
 
           cat > "$HOME/bin/start_upterm.sh" <<'UPTERM_SH'
           #!/usr/bin/env bash
@@ -70,7 +68,7 @@ jobs:
           done
 
           if [ -z "$SSH_CMD" ]; then
-            echo "Could not get SSH command from upterm. tmux screen:"
+            echo "Could not get SSH command from upterm."
             tmux capture-pane -p -t upterm-wrapper 2>/dev/null || true
             exit 1
           fi
@@ -114,128 +112,109 @@ jobs:
           done
           UPTERM_SH
 
-          cat > "$HOME/get_creds.sh" <<'CREDS_SH'
-          #!/usr/bin/env bash
-          set -e
-          export PATH="$HOME/bin:$PATH"
-          mkdir -p "$HOME/eas-project" "$HOME/eas-creds"
-          cd "$HOME/eas-project"
-          git init -q 2>/dev/null || true
+          chmod +x "$HOME/bin/start_upterm.sh"
 
-          if [ -z "${EXPO_TOKEN:-}" ]; then
-            echo "== Log in to Expo =="
-            eas login
-          fi
-
-          echo
-          read -r -p "Expo account (owner) username: " OWNER
-          read -r -p "Project slug: " SLUG
-          read -r -p "Project ID (uuid): " PID
-          read -r -p "iOS bundle identifier: " BID
-
-          printf '{"name":"%s","version":"1.0.0"}\n' "$SLUG" > package.json
-          cat > app.json <<JSON
-          {
-            "expo": {
-              "name": "$SLUG",
-              "slug": "$SLUG",
-              "owner": "$OWNER",
-              "version": "1.0.0",
-              "ios": { "bundleIdentifier": "$BID" },
-              "extra": { "eas": { "projectId": "$PID" } }
-            }
-          }
-          JSON
-          printf '{"build":{"preview":{"distribution":"internal"},"production":{}}}\n' > eas.json
-
-          echo
-          echo "Pick: iOS -> your build profile -> 'credentials.json: Upload/Download'"
-          echo "-> 'Download credentials from EAS to credentials.json'. Then quit."
-          eas credentials --platform ios
-
-          if [ ! -f credentials.json ]; then
-            echo "credentials.json was not created. Run ~/get_creds.sh again."
-            exit 1
-          fi
-
+      - name: Load signing credentials from certs/
+        env:
+          P12_SECRET_PASS: ${{ secrets.P12_PASSWORD }}
+        run: |
           python3 - <<'PY'
-          import json, os, shutil
+          import glob, os, re, shutil, subprocess
 
-          data = json.load(open("credentials.json", encoding="utf-8"))
-          ios = data.get("ios", data)
           dest = os.path.expanduser("~/eas-creds")
-          shutil.copy(ios["provisioningProfilePath"], os.path.join(dest, "profile.mobileprovision"))
-          shutil.copy(ios["distributionCertificate"]["path"], os.path.join(dest, "dist.p12"))
-          with open(os.path.join(dest, "p12pass"), "w", encoding="utf-8") as f:
-              f.write(ios["distributionCertificate"]["password"])
-          print("Copied profile.mobileprovision, dist.p12, and p12pass")
+          os.makedirs(dest, exist_ok=True)
+
+          def first_match(patterns):
+              for pat in patterns:
+                  matches = sorted(glob.glob(pat))
+                  if matches:
+                      return matches[0]
+              return None
+
+          p12_path = first_match([
+              "certs/DistCert_F43463453955D01DBC0808FD106B35F.p12",
+              "certs/DistCert_*.p12",
+              "DistCert_*.p12",
+          ])
+          md_path = first_match([
+              "certs/DistCertCredentials_F43463453955D01DBC0808FD106B35F.md",
+              "certs/DistCertCredentials_*.md",
+              "DistCertCredentials_*.md",
+          ])
+          prov_path = first_match([
+              "certs/profile.mobileprovision",
+              "certs/*.mobileprovision",
+              "*.mobileprovision",
+          ])
+
+          if not p12_path:
+              raise SystemExit("ERROR: Certificate .p12 not found in certs/")
+          if not prov_path:
+              raise SystemExit("ERROR: Provisioning profile not found in certs/")
+
+          password = os.environ.get("P12_SECRET_PASS", "").strip()
+          if not password and md_path:
+              md_text = open(md_path, encoding="utf-8").read()
+              m = re.search(r"password:\s*`?([^\s`]+)`?", md_text, re.I)
+              if m:
+                  password = m.group(1).strip()
+          if not password:
+              password = os.environ["DEFAULT_P12_PASS"]
+
+          p12_dest = os.path.join(dest, "dist.p12")
+          pass_dest = os.path.join(dest, "p12pass")
+          cert_dest = os.path.join(dest, "cert.pem")
+          key_dest = os.path.join(dest, "key.pem")
+          prov_dest = os.path.join(dest, "profile.mobileprovision")
+
+          shutil.copy(p12_path, p12_dest)
+          shutil.copy(prov_path, prov_dest)
+          with open(pass_dest, "w", encoding="utf-8") as f:
+              f.write(password)
+
+          extracted = False
+          for openssl_bin in ("openssl", "/opt/homebrew/bin/openssl", "/usr/local/bin/openssl"):
+              if not shutil.which(openssl_bin):
+                  continue
+              for legacy in ([], ["-legacy"]):
+                  c_res = subprocess.run(
+                      [openssl_bin, "pkcs12", *legacy, "-in", p12_dest,
+                       "-passin", f"file:{pass_dest}", "-nokeys", "-clcerts"],
+                      capture_output=True, text=True
+                  )
+                  k_res = subprocess.run(
+                      [openssl_bin, "pkcs12", *legacy, "-in", p12_dest,
+                       "-passin", f"file:{pass_dest}", "-nodes", "-nocerts"],
+                      capture_output=True, text=True
+                  )
+                  if c_res.returncode == 0 and k_res.returncode == 0 and "-----BEGIN CERTIFICATE-----" in c_res.stdout and "-----BEGIN" in k_res.stdout:
+                      certs = re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", c_res.stdout, re.S)
+                      keys = re.findall(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", k_res.stdout, re.S)
+                      if certs and keys:
+                          with open(cert_dest, "w", encoding="utf-8") as f:
+                              f.write("\n".join(certs) + "\n")
+                          with open(key_dest, "w", encoding="utf-8") as f:
+                              f.write(keys[0].strip() + "\n")
+                          extracted = True
+                          break
+              if extracted:
+                  break
+
+          if not extracted:
+              raise SystemExit("ERROR: Failed to extract cert.pem and key.pem from .p12")
+
+          print("Loaded:", p12_path, "and", prov_path)
           PY
 
-          cd "$HOME/eas-creds"
-          for O in openssl /opt/homebrew/bin/openssl /usr/local/bin/openssl; do
-            command -v "$O" >/dev/null 2>&1 || continue
-            for L in "" "-legacy"; do
-              if "$O" pkcs12 $L -in dist.p12 -passin file:p12pass -nodes -nocerts -out key.raw 2>/dev/null \
-                 && "$O" pkcs12 $L -in dist.p12 -passin file:p12pass -nokeys -clcerts -out cert.raw 2>/dev/null; then
-                break 2
-              fi
-            done
-          done
-
-          sed -n '/-----BEGIN/,/-----END/p' key.raw > key.pem
-          sed -n '/-----BEGIN/,/-----END/p' cert.raw > cert.pem
-          rm -f key.raw cert.raw
-
-          if [ -s key.pem ] && [ -s cert.pem ] && [ -s profile.mobileprovision ]; then
-            echo "OK: key.pem, cert.pem, and profile.mobileprovision are ready. Type 'exit' to continue."
-          else
-            echo "ERROR: Missing or empty credential outputs."
-            exit 1
-          fi
-          CREDS_SH
-
-          chmod +x "$HOME/bin/start_upterm.sh" "$HOME/get_creds.sh"
-
-      - name: Restore saved credentials
-        uses: actions/cache/restore@v4
-        with:
-          path: creds.enc
-          key: eas-creds-v1
-          restore-keys: |
-            eas-creds-
-
-      - name: Check saved credentials
-        id: creds
-        env:
-          SESSION_KEY: ${{ secrets.SESSION_KEY || secrets.GIST_TOKEN }}
-        run: |
-          ok=false
-          if [ -f creds.enc ] && [ -n "$SESSION_KEY" ]; then
-            if openssl enc -d -aes-256-cbc -pbkdf2 -pass env:SESSION_KEY -in creds.enc | tar -xz -C "$HOME"; then
-              if [ -s "$HOME/eas-creds/key.pem" ] && [ -s "$HOME/eas-creds/cert.pem" ] && [ -s "$HOME/eas-creds/profile.mobileprovision" ]; then
-                ok=true
-              fi
-            fi
-          fi
-          echo "Saved credentials usable: $ok"
-          echo "ok=$ok" >> "$GITHUB_OUTPUT"
-
-      - name: Open SSH to pull EAS credentials
-        if: steps.creds.outputs.ok != 'true'
-        env:
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-        run: |
-          "$HOME/bin/start_upterm.sh" "Run ~/get_creds.sh to pull EAS credentials, then type exit to continue."
-
-      - name: Validate provisioning profile and derive bundle ID
+      - name: Validate profile, certificate, and UDID
         run: |
           python3 - <<'PY'
           import os, plistlib, ssl, subprocess, sys
 
           home = os.path.expanduser("~")
+          prof_file = os.path.join(home, "eas-creds", "profile.mobileprovision")
           r = subprocess.run(
-              ["security", "cms", "-D", "-i", os.path.join(home, "eas-creds", "profile.mobileprovision")],
+              ["security", "cms", "-D", "-i", prof_file],
               capture_output=True,
               check=True,
           )
@@ -381,26 +360,6 @@ jobs:
               with open(summary_path, "a", encoding="utf-8") as s:
                   s.write(f"### LiveContainer OTA Link\n`{itms}`\n")
           PY
-
-      - name: Pack and cache credentials
-        if: always()
-        id: pack
-        env:
-          SESSION_KEY: ${{ secrets.SESSION_KEY || secrets.GIST_TOKEN }}
-        run: |
-          if [ -s "$HOME/eas-creds/key.pem" ] && [ -s "$HOME/eas-creds/cert.pem" ] && [ -s "$HOME/eas-creds/profile.mobileprovision" ] && [ -n "${SESSION_KEY:-}" ]; then
-            tar -cz -C "$HOME" eas-creds | openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:SESSION_KEY -out creds.enc
-            echo "packed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "packed=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Save credentials cache
-        if: always() && steps.pack.outputs.packed == 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: creds.enc
-          key: eas-creds-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Open upterm on failure
         if: failure() && inputs.debug_upterm
