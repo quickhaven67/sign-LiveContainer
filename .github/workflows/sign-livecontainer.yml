@@ -275,6 +275,20 @@ jobs:
               print("devices in profile:", len(devs), "| your UDID included:", UDID in devs)
               granted = pr.get("Entitlements", {})
               print("entitlements NOT granted by profile:", sorted(k for k in e if k not in granted) or "none")
+              print("profile entitlement keys:", sorted(granted))
+
+              def uncovered(vals, allowed):
+                  return [v for v in vals if not any(v == a or (a.endswith("*") and v.startswith(a[:-1])) for a in allowed)]
+
+              for k in ("com.apple.security.application-groups", "keychain-access-groups"):
+                  if k in e:
+                      allowed = granted.get(k, [])
+                      bad = uncovered(e[k], allowed)
+                      print(k, "| binary:", len(e[k]), "items, first:", e[k][:2], "| profile allows:", allowed[:3],
+                            "| binary items NOT covered by profile:", len(bad), bad[:3])
+              for k, v in e.items():
+                  if not isinstance(v, list) and k in granted and granted[k] != v:
+                      print("value differs:", k, "binary =", v, "| profile =", granted[k])
           PY
 
       - name: Host IPA and update Gist manifest
