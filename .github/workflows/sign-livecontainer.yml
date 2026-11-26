@@ -23,10 +23,11 @@ jobs:
       - name: Install plumesign and tools
         run: |
           brew install jq || true
-          if ! command -v plumesign >/dev/null 2>&1; then
-            curl -fsSL -o /tmp/plumesign.tar.gz "https://github.com/claration/impactor/releases/latest/download/plumesign-macos-arm64.tar.gz" || true
-            tar -xzf /tmp/plumesign.tar.gz -C /usr/local/bin/ 2>/dev/null || true
-          fi
+          mkdir -p "$HOME/bin"
+          curl -fsSL -L -o "$HOME/bin/plumesign" "https://github.com/claration/impactor/releases/latest/download/plumesign-macos-universal"
+          chmod +x "$HOME/bin/plumesign"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/plumesign" --help >/dev/null
 
       - name: Authenticate with Apple Developer account
         env:
@@ -117,4 +118,31 @@ jobs:
           gist_token = os.environ.get("GIST_TOKEN", "")
           plist_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict><key>items</key><array><dict><key>assets</key><array><dict><key>kind</key><string>software-package</string><key>url</key><string>{ipa_url}</string></dict></array><key>metadata</key><dict><key>bundle-identifier</key><string>com.kdt.livecontainer.V9CQYDJ2NX</string><key>bundle-version</key><string>1.0</string><key>kind</key><string>software</string><key>
+          <plist version="1.0"><dict><key>items</key><array><dict><key>assets</key><array><dict><key>kind</key><string>software-package</string><key>url</key><string>{ipa_url}</string></dict></array><key>metadata</key><dict><key>bundle-identifier</key><string>com.kdt.livecontainer.V9CQYDJ2NX</string><key>bundle-version</key><string>1.0</string><key>kind</key><string>software</string><key>title</key><string>LiveContainer</string></dict></dict></array></dict></plist>"""
+
+          if gist_token:
+              payload = json.dumps({"files": {"manifest.plist": {"content": plist_xml}}}).encode("utf-8")
+              req = urllib.request.Request(
+                  "https://api.github.com/gists/a780f323dcc1db7243c296f4997f43e9",
+                  data=payload,
+                  method="PATCH",
+                  headers={
+                      "Authorization": f"Bearer {gist_token}",
+                      "Content-Type": "application/json",
+                      "User-Agent": "github-actions",
+                  },
+              )
+              res = json.loads(urllib.request.urlopen(req).read().decode("utf-8"))
+              raw_url = res["files"]["manifest.plist"]["raw_url"]
+              itms_url = "itms-services://?action=download-manifest&url=" + urllib.parse.quote(raw_url, safe="")
+              print("GIST_RAW_URL=" + raw_url)
+              print("ITMS_URL=" + itms_url)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+                  s.write(f"### LiveContainer OTA Link\n`{itms_url}`\n")
+          PY
+
+      - name: Start upterm on failure if requested
+        if: failure() && inputs.debug_upterm
+        run: |
+          brew install upterm || true
+          upterm host --accept-host-key --force-command "bash -l" -- tmux new -As debug
