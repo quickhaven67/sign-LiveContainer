@@ -34,21 +34,16 @@ jobs:
           brew install franklintra/tap/splice openssl@3 jq
           splice --help
 
-      - name: Download latest LiveContainer IPA from GitHub Releases
+      - name: Download latest Nightly LiveContainer IPA
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IPA_VARIANT: ${{ inputs.ipa_variant }}
         run: |
           mkdir -p work output
-          RELEASE_JSON=$(curl -fsSL https://api.github.com/repos/LiveContainer/LiveContainer/releases/latest)
-          DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r --arg name "$IPA_VARIANT" '.assets[] | select(.name == $name) | .browser_download_url')
-
-          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
-            echo "Error: Could not find asset $IPA_VARIANT in latest LiveContainer release."
-            exit 1
-          fi
-
-          echo "Downloading $IPA_VARIANT from $DOWNLOAD_URL..."
-          curl -fL "$DOWNLOAD_URL" -o "work/$IPA_VARIANT"
+          gh release download nightly \
+            --repo LiveContainer/LiveContainer \
+            --pattern "$IPA_VARIANT" \
+            --dir work
           ls -lh "work/$IPA_VARIANT"
 
       - name: Restore cached Apple GS session & ADI machine state
