@@ -8,10 +8,10 @@ on:
         required: false
         default: ""
       debug_upterm:
-        description: "Start upterm SSH session on failure"
+        description: "Open upterm SSH session for interactive 2FA / debugging"
         required: false
         type: boolean
-        default: false
+        default: true
 
 jobs:
   sign-and-publish:
@@ -20,9 +20,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install plumesign and tools
+      - name: Install plumesign, upterm, and tools
         run: |
-          brew install jq || true
+          brew install jq upterm || true
           mkdir -p "$HOME/bin"
           curl -fsSL -L -o "$HOME/bin/plumesign" "https://github.com/claration/impactor/releases/latest/download/plumesign-macos-universal"
           chmod +x "$HOME/bin/plumesign"
@@ -34,8 +34,21 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           TWO_FACTOR_CODE: ${{ secrets.TWO_FACTOR_CODE }}
+          DEBUG_UPTERM: ${{ inputs.debug_upterm }}
         run: |
-          plumesign account login --username "$APPLE_ID" --password "$APPLE_PASSWORD" ${TWO_FACTOR_CODE:+--code "$TWO_FACTOR_CODE"}
+          CLEAN_ID=$(printf '%s' "$APPLE_ID" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+          CLEAN_PW=$(printf '%s' "$APPLE_PASSWORD" | tr -d '\r\n')
+          CLEAN_2FA=$(printf '%s' "$TWO_FACTOR_CODE" | tr -d '[:space:]')
+          if plumesign account login --username "$CLEAN_ID" --password "$CLEAN_PW" ${CLEAN_2FA:+--code "$CLEAN_2FA"}; then
+            echo "Authenticated successfully"
+          elif [ "$DEBUG_UPTERM" = "true" ]; then
+            echo "2FA or login needed—starting upterm session..."
+            export CLEAN_ID CLEAN_PW
+            upterm host --accept-host-key --force-command "bash -l" -- tmux new -As auth
+            plumesign account login --username "$CLEAN_ID" --password "$CLEAN_PW"
+          else
+            exit 1
+          fi
 
       - name: Download source IPA
         env:
