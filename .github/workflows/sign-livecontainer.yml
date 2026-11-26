@@ -44,7 +44,7 @@ jobs:
           CLEAN_PW=$(printf '%s' "$APPLE_PASSWORD" | tr -d '\r\n')
           OTP=$(printf '%s' "${INPUT_OTP:-$TWO_FACTOR_CODE}" | tr -d '[:space:]')
           if [ -n "$OTP" ]; then
-            plumesign account login --username "$CLEAN_ID" --password "$CLEAN_PW" --code "$OTP"
+            printf '%s\n' "$OTP" | plumesign account login --username "$CLEAN_ID" --password "$CLEAN_PW"
           else
             plumesign account login --username "$CLEAN_ID" --password "$CLEAN_PW"
           fi
