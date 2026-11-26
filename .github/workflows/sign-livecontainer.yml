@@ -7,6 +7,11 @@ on:
         description: "Direct URL to source LiveContainer+SideStore.ipa (defaults to latest release asset)"
         required: false
         default: ""
+      ssh_before_auth:
+        description: "Open upterm SSH session before running Apple authentication"
+        required: false
+        type: boolean
+        default: true
       debug_upterm:
         description: "Open upterm SSH session on failure"
         required: false
@@ -28,6 +33,23 @@ jobs:
           chmod +x "$HOME/bin/plumesign"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           "$HOME/bin/plumesign" --help >/dev/null
+
+      - name: Open upterm session before authentication
+        if: inputs.ssh_before_auth
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+        run: |
+          CLEAN_ID=$(printf '%s' "$APPLE_ID" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+          CLEAN_PW=$(printf '%s' "$APPLE_PASSWORD" | tr -d '\r\n')
+          cat <<EOF > "$HOME/login_apple.sh"
+          #!/usr/bin/env bash
+          export PATH="\$HOME/bin:\$PATH"
+          plumesign account login --username "$CLEAN_ID" --password "$CLEAN_PW"
+          EOF
+          chmod +x "$HOME/login_apple.sh"
+          echo "Run ~/login_apple.sh in the SSH session to authenticate interactively, then exit tmux/upterm to continue."
+          upterm host --accept-host-key --force-command "bash -l" -- tmux new -As auth
 
       - name: Authenticate with Apple Developer account
         env:
