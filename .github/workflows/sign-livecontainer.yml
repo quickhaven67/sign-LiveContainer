@@ -18,27 +18,111 @@ on:
         type: boolean
         default: true
 
+# needed for the `gh release create` fallback
+permissions:
+  contents: write
+
 jobs:
   sign-and-publish:
     runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      GIST_ID: a780f323dcc1db7243c296f4997f43e9
+      BUNDLE_ID: com.kdt.livecontainer.V9CQYDJ2NX
+      CERT_NAME: Dennis Lawson
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install plumesign and tools
+      - name: Install tools and helper scripts
         run: |
-          brew install jq || true
+          brew install jq tmux || true
           brew install owenthereal/upterm/upterm
           mkdir -p "$HOME/bin" "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
-          if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
-            ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
-          fi
-          curl -fsSL -L -o "$HOME/bin/plumesign" "https://github.com/claration/impactor/releases/latest/download/plumesign-macos-universal"
+          [ -f "$HOME/.ssh/id_ed25519" ] || ssh-keygen -q -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
+
+          curl -fsSL -o "$HOME/bin/plumesign" "https://github.com/claration/impactor/releases/latest/download/plumesign-macos-universal"
           chmod +x "$HOME/bin/plumesign"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           "$HOME/bin/plumesign" --help >/dev/null
           upterm version
+
+          # ---- helper: start upterm (with a TTY via tmux), publish SSH cmd to Gist, wait ----
+          cat > "$HOME/bin/start_upterm.sh" <<'UPTERM_SH'
+          #!/usr/bin/env bash
+          export PATH="$HOME/bin:$PATH"
+          HINT="${1:-Session ready.}"
+          TIMEOUT="${UPTERM_TIMEOUT:-1800}"
+
+          tmux kill-session -t upterm-wrapper 2>/dev/null
+          # upterm needs a TTY; a detached tmux session provides one
+          tmux new-session -d -s upterm-wrapper -x 200 -y 50 \
+            "upterm host --accept --skip-host-key-check ${UPTERM_ARGS:-} -- bash -l"
+
+          SSH_CMD=""
+          for _ in $(seq 1 60); do
+            SSH_CMD=$(upterm session current 2>/dev/null | grep -Eo 'ssh [A-Za-z0-9._@:-]+@[^[:space:]]+' | head -n 1)
+            [ -n "$SSH_CMD" ] && break
+            sleep 1
+          done
+
+          if [ -z "$SSH_CMD" ]; then
+            echo "Could not get SSH command from upterm. tmux screen:"
+            tmux capture-pane -p -t upterm-wrapper 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "UPTERM_SSH=$SSH_CMD"
+
+          if [ -n "${GIST_TOKEN:-}" ]; then
+            SSH_CMD="$SSH_CMD" HINT="$HINT" python3 - <<'PY' || echo "Gist update failed (continuing)"
+          import json, os, urllib.request
+
+          content = "\n".join([
+              "run " + os.environ.get("GITHUB_RUN_ID", "?"),
+              os.environ["HINT"],
+              os.environ["SSH_CMD"],
+              "",
+          ])
+          body = json.dumps({"files": {"upterm_ssh.txt": {"content": content}}}).encode()
+          req = urllib.request.Request(
+              "https://api.github.com/gists/" + os.environ["GIST_ID"],
+              data=body,
+              method="PATCH",
+              headers={
+                  "Authorization": "Bearer " + os.environ["GIST_TOKEN"],
+                  "Content-Type": "application/json",
+                  "User-Agent": "github-actions",
+              },
+          )
+          urllib.request.urlopen(req, timeout=20).read()
+          print("SSH command published to Gist")
+          PY
+          fi
+
+          # block until the shell exits ("exit") or we time out
+          DEADLINE=$((SECONDS + TIMEOUT))
+          while tmux has-session -t upterm-wrapper 2>/dev/null; do
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "upterm session timed out"
+              tmux kill-session -t upterm-wrapper 2>/dev/null
+              break
+            fi
+            sleep 5
+          done
+          UPTERM_SH
+
+          # ---- helper: run inside the SSH shell to log in (reads secrets from env) ----
+          cat > "$HOME/login_apple.sh" <<'LOGIN_SH'
+          #!/usr/bin/env bash
+          export PATH="$HOME/bin:$PATH"
+          ID=$(printf '%s' "$APPLE_ID" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+          PW=$(printf '%s' "$APPLE_PASSWORD" | tr -d '\r\n')
+          plumesign account login --username "$ID" --password "$PW"
+          LOGIN_SH
+
+          chmod +x "$HOME/bin/start_upterm.sh" "$HOME/login_apple.sh"
 
       - name: Open upterm session before authentication
         if: inputs.ssh_before_auth
@@ -46,73 +130,18 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          # Optional lock-down: only your GitHub SSH keys can connect
+          # UPTERM_ARGS: "--github-user quickhaven67"
         run: |
-          CLEAN_ID=$(printf '%s' "$APPLE_ID" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-          CLEAN_PW=$(printf '%s' "$APPLE_PASSWORD" | tr -d '\r\n')
-          printf '#!/usr/bin/env bash\nset -e\nexport PATH="%s/bin:$PATH"\nplumesign account login --username "%s" --password "%s"\n' "$HOME" "$CLEAN_ID" "$CLEAN_PW" > "$HOME/login_apple.sh"
-          chmod +x "$HOME/login_apple.sh"
-
-          : > /tmp/upterm.log
-          upterm host --accept-host-key --force-command "bash -l" > /tmp/upterm.log 2>&1 &
-          UPTERM_PID=$!
-
-          SSH_CMD=""
-          for _ in $(seq 1 40); do
-            SSH_CMD=$(upterm session current --json 2>/dev/null | jq -r '.ssh // empty' 2>/dev/null || true)
-            if [ -z "$SSH_CMD" ]; then
-              SSH_CMD=$(upterm session current 2>/dev/null | grep -Eo 'ssh [A-Za-z0-9._@-]+@[^[:space:]]+' | head -n 1 || true)
-            fi
-            if [ -z "$SSH_CMD" ]; then
-              SSH_CMD=$(grep -Eo 'ssh [A-Za-z0-9._@-]+@[^[:space:]]+' /tmp/upterm.log 2>/dev/null | head -n 1 || true)
-            fi
-            if [ -n "$SSH_CMD" ]; then
-              break
-            fi
-            sleep 1
-          done
-
-          if [ -z "$SSH_CMD" ]; then
-            echo "Failed to capture SSH command. /tmp/upterm.log contents:"
-            cat /tmp/upterm.log || true
-            exit 1
-          fi
-
-          echo "UPTERM_SSH=$SSH_CMD"
-          if [ -n "$GIST_TOKEN" ]; then
-            SSH_CMD="$SSH_CMD" GIST_TOKEN="$GIST_TOKEN" python3 -c '
-import json, os, urllib.request
-
-payload = json.dumps({
-    "files": {
-        "upterm_ssh.txt": {
-            "content": f"Run in SSH: ~/login_apple.sh\nThen exit SSH to continue.\n{os.environ[\"SSH_CMD\"]}\n"
-        }
-    }
-}).encode("utf-8")
-req = urllib.request.Request(
-    "https://api.github.com/gists/a780f323dcc1db7243c296f4997f43e9",
-    data=payload,
-    method="PATCH",
-    headers={
-        "Authorization": f"Bearer {os.environ[\"GIST_TOKEN\"]}",
-        "Content-Type": "application/json",
-        "User-Agent": "github-actions",
-    },
-)
-urllib.request.urlopen(req, timeout=20).read()
-'
-          fi
-
-          wait "$UPTERM_PID" || true
+          "$HOME/bin/start_upterm.sh" "In the SSH session run: ~/login_apple.sh  then type exit to continue."
 
       - name: Authenticate with Apple Developer account
+        if: ${{ !inputs.ssh_before_auth }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
         run: |
-          CLEAN_ID=$(printf '%s' "$APPLE_ID" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-          CLEAN_PW=$(printf '%s' "$APPLE_PASSWORD" | tr -d '\r\n')
-          plumesign account login --username "$CLEAN_ID" --password "$CLEAN_PW"
+          "$HOME/login_apple.sh"
 
       - name: Download source IPA
         env:
@@ -123,11 +152,13 @@ urllib.request.urlopen(req, timeout=20).read()
           if [ -n "$INPUT_IPA_URL" ]; then
             curl -fsSL -o build/source.ipa "$INPUT_IPA_URL"
           else
-            ASSET_URL=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 5 --json tagName,assets --jq '[.[] | .assets[]? | select(.name | test("LiveContainer.*\\.ipa$"; "i")) | select(.name | test("signed|fixed"; "i") | not)][0].url')
-            if [ -z "$ASSET_URL" ]; then
-              ASSET_URL=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 5 --json assets --jq '[.[] | .assets[]?][0].url')
+            RELEASES=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=10")
+            ASSET_API_URL=$(printf '%s' "$RELEASES" | jq -r '[.[].assets[] | select(.name | test("LiveContainer.*\\.ipa$"; "i")) | select(.name | test("signed|fixed"; "i") | not)][0].url // empty')
+            if [ -z "$ASSET_API_URL" ]; then
+              echo "::error::No LiveContainer IPA found in the last 10 releases. Upload one or pass ipa_url."
+              exit 1
             fi
-            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o build/source.ipa "$ASSET_URL"
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o build/source.ipa "$ASSET_API_URL"
           fi
           ls -lh build/source.ipa
 
@@ -136,47 +167,62 @@ urllib.request.urlopen(req, timeout=20).read()
           plumesign sign \
             --input build/source.ipa \
             --output build/LiveContainer+SideStore-signed.ipa \
-            --bundle-id com.kdt.livecontainer.V9CQYDJ2NX \
+            --bundle-id "$BUNDLE_ID" \
             --udid 00008130-0014442622DB803A
 
       - name: Strip application-groups from signed Mach-O entitlements and re-sign
         run: |
           rm -rf build/resign && mkdir -p build/resign
           unzip -q build/LiveContainer+SideStore-signed.ipa -d build/resign
-          CERT=$(security find-identity -v -p codesigning | awk '/Dennis Lawson/{print $2; exit}')
-          export CERT
-          python3 -c '
-import glob, os, plistlib, re, subprocess
 
-bins = sorted(
-    glob.glob("build/resign/Payload/*.app/LiveContainer")
-    + glob.glob("build/resign/Payload/*.app/PlugIns/*.appex/*")
-)
-for p in bins:
-    if not os.path.isfile(p) or os.path.islink(p):
-        continue
-    if p.endswith((".plist", ".car", ".mobileprovision", ".appintents", ".intentdefinition", ".bundle")):
-        continue
-    raw = open(p, "rb").read().decode("latin1")
-    matches = re.findall(r"<\?xml.*?</plist>", raw, re.S)
-    for m in matches:
-        if "com.apple.security.application-groups" in m:
-            d = plistlib.loads(m.encode("utf-8"))
-            d.pop("com.apple.security.application-groups", None)
-            ent_path = p + ".entitlements.plist"
-            with open(ent_path, "wb") as f:
-                plistlib.dump(d, f)
-            subprocess.run(
-                ["codesign", "-f", "-s", os.environ["CERT"], "--entitlements", ent_path, "--timestamp=none", p],
-                check=False,
-            )
-            break
-'
-          find build/resign/Payload/LiveContainer.app -depth \( -name "*.dylib" -o -name "*.framework" -o -name "*.appex" \) -exec codesign -f -s "$CERT" --timestamp=none {} + 2>/dev/null || true
-          MAIN_ENT="build/resign/Payload/LiveContainer.app/LiveContainer.entitlements.plist"
-          if [ -f "$MAIN_ENT" ]; then
-            codesign -f -s "$CERT" --entitlements "$MAIN_ENT" --timestamp=none build/resign/Payload/LiveContainer.app || true
+          CERT=$(security find-identity -v -p codesigning | awk -v n="$CERT_NAME" 'index($0, n) {print $2; exit}')
+          if [ -z "$CERT" ]; then
+            echo "::error::No codesigning identity matching '$CERT_NAME' in the keychain"
+            security find-identity -v -p codesigning || true
+            exit 1
           fi
+          export CERT
+
+          python3 - <<'PY'
+          import glob, os, plistlib, re, subprocess
+
+          bins = sorted(
+              glob.glob("build/resign/Payload/*.app/LiveContainer")
+              + glob.glob("build/resign/Payload/*.app/PlugIns/*.appex/*")
+          )
+          for p in bins:
+              if not os.path.isfile(p) or os.path.islink(p):
+                  continue
+              if p.endswith((".plist", ".car", ".mobileprovision", ".appintents", ".intentdefinition", ".bundle")):
+                  continue
+              raw = open(p, "rb").read().decode("latin1")
+              for m in re.findall(r"<\?xml.*?</plist>", raw, re.S):
+                  if "com.apple.security.application-groups" in m:
+                      d = plistlib.loads(m.encode("utf-8"))
+                      d.pop("com.apple.security.application-groups", None)
+                      ent_path = p + ".entitlements.plist"
+                      with open(ent_path, "wb") as f:
+                          plistlib.dump(d, f)
+                      r = subprocess.run(
+                          ["codesign", "-f", "-s", os.environ["CERT"], "--entitlements", ent_path, "--timestamp=none", p],
+                          check=False,
+                      )
+                      print(p, "-> codesign exit", r.returncode)
+                      break
+          PY
+
+          # nested code; preserve the entitlements we just wrote (codesign -f drops them otherwise)
+          find build/resign/Payload -depth \( -name "*.dylib" -o -name "*.framework" -o -name "*.appex" \) \
+            -exec codesign -f -s "$CERT" --preserve-metadata=entitlements --timestamp=none {} + || true
+
+          APP=$(ls -d build/resign/Payload/*.app | head -n 1)
+          MAIN_ENT="$APP/LiveContainer.entitlements.plist"
+          if [ -f "$MAIN_ENT" ]; then
+            codesign -f -s "$CERT" --entitlements "$MAIN_ENT" --timestamp=none "$APP"
+          else
+            echo "::warning::$MAIN_ENT was not generated; app bundle not re-signed"
+          fi
+
           (cd build/resign && zip -qry ../final.ipa Payload) && mv build/final.ipa build/LiveContainer+SideStore-signed.ipa
           ls -lh build/LiveContainer+SideStore-signed.ipa
 
@@ -185,49 +231,63 @@ for p in bins:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          IPA_URL=$(curl -fsSL -F "file=@build/LiveContainer+SideStore-signed.ipa" https://pixeldrain.com/api/file 2>/dev/null | jq -r '.id // empty' | xargs -I{} echo "https://pixeldrain.com/api/file/{}?download")
-          if [ -z "$IPA_URL" ]; then
+          IPA=build/LiveContainer+SideStore-signed.ipa
+          PD_ID=$(curl -fsS -F "file=@$IPA" https://pixeldrain.com/api/file 2>/dev/null | jq -r '.id // empty' || true)
+          if [ -n "$PD_ID" ]; then
+            IPA_URL="https://pixeldrain.com/api/file/${PD_ID}?download"
+          else
             TAG="signed-$(date +%s)"
-            gh release create "$TAG" build/LiveContainer+SideStore-signed.ipa --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Automated OTA build" --prerelease
-            IPA_URL=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[0].browserDownloadUrl')
+            gh release create "$TAG" "$IPA" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Automated OTA build" --prerelease
+            IPA_URL=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[0].url')
           fi
           echo "IPA_URL=$IPA_URL"
-          IPA_URL="$IPA_URL" GIST_TOKEN="$GIST_TOKEN" python3 -c '
-import json, os, urllib.parse, urllib.request
+          export IPA_URL
 
-ipa_url = os.environ["IPA_URL"]
-gist_token = os.environ.get("GIST_TOKEN", "")
-plist_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict><key>items</key><array><dict><key>assets</key><array><dict><key>kind</key><string>software-package</string><key>url</key><string>{ipa_url}</string></dict></array><key>metadata</key><dict><key>bundle-identifier</key><string>com.kdt.livecontainer.V9CQYDJ2NX</string><key>bundle-version</key><string>1.0</string><key>kind</key><string>software</string><key>title</key><string>LiveContainer</string></dict></dict></array></dict></plist>"""
+          python3 - <<'PY'
+          import json, os, plistlib, urllib.parse, urllib.request
 
-if gist_token:
-    payload = json.dumps({"files": {"manifest.plist": {"content": plist_xml}}}).encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.github.com/gists/a780f323dcc1db7243c296f4997f43e9",
-        data=payload,
-        method="PATCH",
-        headers={
-            "Authorization": f"Bearer {gist_token}",
-            "Content-Type": "application/json",
-            "User-Agent": "github-actions",
-        },
-    )
-    res = json.loads(urllib.request.urlopen(req).read().decode("utf-8"))
-    raw_url = res["files"]["manifest.plist"]["raw_url"]
-    itms_url = "itms-services://?action=download-manifest&url=" + urllib.parse.quote(raw_url, safe="")
-    print("GIST_RAW_URL=" + raw_url)
-    print("ITMS_URL=" + itms_url)
-    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
-        s.write(f"### LiveContainer OTA Link\n`{itms_url}`\n")
-'
+          token = os.environ.get("GIST_TOKEN", "")
+          if not token:
+              raise SystemExit("GIST_TOKEN is not set; cannot update manifest")
 
-      - name: Start upterm on failure if requested
+          manifest = {
+              "items": [{
+                  "assets": [{"kind": "software-package", "url": os.environ["IPA_URL"]}],
+                  "metadata": {
+                      "bundle-identifier": os.environ["BUNDLE_ID"],
+                      "bundle-version": "1.0",
+                      "kind": "software",
+                      "title": "LiveContainer",
+                  },
+              }]
+          }
+          body = json.dumps({"files": {"manifest.plist": {"content": plistlib.dumps(manifest).decode()}}}).encode()
+          req = urllib.request.Request(
+              "https://api.github.com/gists/" + os.environ["GIST_ID"],
+              data=body,
+              method="PATCH",
+              headers={
+                  "Authorization": "Bearer " + token,
+                  "Content-Type": "application/json",
+                  "User-Agent": "github-actions",
+              },
+          )
+          res = json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
+          raw_url = res["files"]["manifest.plist"]["raw_url"]
+          itms = "itms-services://?action=download-manifest&url=" + urllib.parse.quote(raw_url, safe="")
+          print("GIST_RAW_URL=" + raw_url)
+          print("ITMS_URL=" + itms)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write("### LiveContainer OTA Link\n`" + itms + "`\n")
+          PY
+
+      - name: Open upterm on failure
         if: failure() && inputs.debug_upterm
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
         run: |
-          brew install owenthereal/upterm/upterm || true
-          mkdir -p "$HOME/.ssh"
-          if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
-            ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
+          if [ ! -x "$HOME/bin/start_upterm.sh" ]; then
+            echo "Helper script missing (job failed before setup)"
+            exit 1
           fi
-          upterm host --accept-host-key --force-command "bash -l"
+          "$HOME/bin/start_upterm.sh" "A step failed. Debug in the SSH session, then type exit."
