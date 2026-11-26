@@ -62,7 +62,11 @@ jobs:
 
           SSH_CMD=""
           for _ in $(seq 1 60); do
-            SSH_CMD=$(upterm session current 2>/dev/null | grep -Eo 'ssh [A-Za-z0-9._@:-]+@[^[:space:]]+' | head -n 1)
+            # upterm prints the session banner to the wrapper's screen, so read it from there
+            SSH_CMD=$(tmux capture-pane -p -J -S -300 -t upterm-wrapper 2>/dev/null | grep -Eo 'ssh [A-Za-z0-9._@:-]+@[^[:space:]]+' | head -n 1)
+            if [ -z "$SSH_CMD" ]; then
+              SSH_CMD=$(upterm session current 2>/dev/null | grep -Eo 'ssh [A-Za-z0-9._@:-]+@[^[:space:]]+' | head -n 1)
+            fi
             [ -n "$SSH_CMD" ] && break
             sleep 1
           done
@@ -130,8 +134,8 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          # Optional lock-down: only your GitHub SSH keys can connect
-          # UPTERM_ARGS: "--github-user quickhaven67"
+          # Optional lock-down: restrict who can join (see `upterm host --help`),
+          # e.g. UPTERM_ARGS: "--authorized-keys /path/to/keys"
         run: |
           "$HOME/bin/start_upterm.sh" "In the SSH session run: ~/login_apple.sh  then type exit to continue."
 
