@@ -48,51 +48,59 @@ jobs:
           CLEAN_ID=$(printf '%s' "$APPLE_ID" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
           CLEAN_PW=$(printf '%s' "$APPLE_PASSWORD" | tr -d '\r\n')
           cat <<EOF > "$HOME/login_apple.sh"
-          #!/usr/bin/env bash
-          set -e
-          export PATH="$HOME/bin:\$PATH"
-          plumesign account login --username "$CLEAN_ID" --password "$CLEAN_PW"
-          EOF
+#!/usr/bin/env bash
+set -e
+export PATH="$HOME/bin:\$PATH"
+plumesign account login --username "$CLEAN_ID" --password "$CLEAN_PW"
+EOF
           chmod +x "$HOME/login_apple.sh"
 
           upterm host --accept-host-key --force-command "bash -l" >/tmp/upterm.log 2>&1 &
           UPTERM_PID=$!
 
           SSH_CMD=""
-          for _ in $(seq 1 30); do
-            if SSH_CMD=$(upterm session current --json 2>/dev/null | jq -r '.ssh // empty') && [ -n "$SSH_CMD" ]; then
-              break
+          for _ in $(seq 1 40); do
+            SSH_CMD=$(upterm session current --json 2>/dev/null | jq -r '.ssh // empty' 2>/dev/null || true)
+            if [ -z "$SSH_CMD" ]; then
+              SSH_CMD=$(upterm session current 2>/dev/null | grep -Eo 'ssh [A-Za-z0-9._@-]+@[^[:space:]]+' | head -n 1 || true)
             fi
-            SSH_CMD=$(upterm session current 2>/dev/null | awk '/ssh /{print; exit}')
+            if [ -z "$SSH_CMD" ]; then
+              SSH_CMD=$(grep -Eo 'ssh [A-Za-z0-9._@-]+@[^[:space:]]+' /tmp/upterm.log 2>/dev/null | head -n 1 || true)
+            fi
             [ -n "$SSH_CMD" ] && break
             sleep 1
           done
-          [ -z "$SSH_CMD" ] && SSH_CMD=$(grep -E 'ssh ' /tmp/upterm.log | head -n 1 || true)
+
+          if [ -z "$SSH_CMD" ]; then
+            echo "Failed to capture SSH command. /tmp/upterm.log contents:"
+            cat /tmp/upterm.log || true
+            exit 1
+          fi
 
           echo "UPTERM_SSH=$SSH_CMD"
-          if [ -n "$GIST_TOKEN" ] && [ -n "$SSH_CMD" ]; then
+          if [ -n "$GIST_TOKEN" ]; then
             SSH_CMD="$SSH_CMD" GIST_TOKEN="$GIST_TOKEN" python3 - <<'PY'
-            import json, os, urllib.request
+import json, os, urllib.request
 
-            payload = json.dumps({
-                "files": {
-                    "upterm_ssh.txt": {
-                        "content": f"Run in SSH: ~/login_apple.sh\nThen exit SSH to continue.\n{os.environ['SSH_CMD']}\n"
-                    }
-                }
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                "https://api.github.com/gists/a780f323dcc1db7243c296f4997f43e9",
-                data=payload,
-                method="PATCH",
-                headers={
-                    "Authorization": f"Bearer {os.environ['GIST_TOKEN']}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "github-actions",
-                },
-            )
-            urllib.request.urlopen(req, timeout=20).read()
-            PY
+payload = json.dumps({
+    "files": {
+        "upterm_ssh.txt": {
+            "content": f"Run in SSH: ~/login_apple.sh\nThen exit SSH to continue.\n{os.environ['SSH_CMD']}\n"
+        }
+    }
+}).encode("utf-8")
+req = urllib.request.Request(
+    "https://api.github.com/gists/a780f323dcc1db7243c296f4997f43e9",
+    data=payload,
+    method="PATCH",
+    headers={
+        "Authorization": f"Bearer {os.environ['GIST_TOKEN']}",
+        "Content-Type": "application/json",
+        "User-Agent": "github-actions",
+    },
+)
+urllib.request.urlopen(req, timeout=20).read()
+PY
           fi
 
           wait "$UPTERM_PID" || true
@@ -136,32 +144,32 @@ jobs:
           CERT=$(security find-identity -v -p codesigning | awk '/Dennis Lawson/{print $2; exit}')
           export CERT
           python3 - <<'PY'
-          import glob, os, plistlib, re, subprocess
+import glob, os, plistlib, re, subprocess
 
-          bins = sorted(
-              glob.glob("build/resign/Payload/*.app/LiveContainer")
-              + glob.glob("build/resign/Payload/*.app/PlugIns/*.appex/*")
-          )
-          for p in bins:
-              if not os.path.isfile(p) or os.path.islink(p):
-                  continue
-              if p.endswith((".plist", ".car", ".mobileprovision", ".appintents", ".intentdefinition", ".bundle")):
-                  continue
-              raw = open(p, "rb").read().decode("latin1")
-              matches = re.findall(r"<\?xml.*?</plist>", raw, re.S)
-              for m in matches:
-                  if "com.apple.security.application-groups" in m:
-                      d = plistlib.loads(m.encode("utf-8"))
-                      d.pop("com.apple.security.application-groups", None)
-                      ent_path = p + ".entitlements.plist"
-                      with open(ent_path, "wb") as f:
-                          plistlib.dump(d, f)
-                      subprocess.run(
-                          ["codesign", "-f", "-s", os.environ["CERT"], "--entitlements", ent_path, "--timestamp=none", p],
-                          check=False,
-                      )
-                      break
-          PY
+bins = sorted(
+    glob.glob("build/resign/Payload/*.app/LiveContainer")
+    + glob.glob("build/resign/Payload/*.app/PlugIns/*.appex/*")
+)
+for p in bins:
+    if not os.path.isfile(p) or os.path.islink(p):
+        continue
+    if p.endswith((".plist", ".car", ".mobileprovision", ".appintents", ".intentdefinition", ".bundle")):
+        continue
+    raw = open(p, "rb").read().decode("latin1")
+    matches = re.findall(r"<\?xml.*?</plist>", raw, re.S)
+    for m in matches:
+        if "com.apple.security.application-groups" in m:
+            d = plistlib.loads(m.encode("utf-8"))
+            d.pop("com.apple.security.application-groups", None)
+            ent_path = p + ".entitlements.plist"
+            with open(ent_path, "wb") as f:
+                plistlib.dump(d, f)
+            subprocess.run(
+                ["codesign", "-f", "-s", os.environ["CERT"], "--entitlements", ent_path, "--timestamp=none", p],
+                check=False,
+            )
+            break
+PY
           find build/resign/Payload/LiveContainer.app -depth \( -name "*.dylib" -o -name "*.framework" -o -name "*.appex" \) -exec codesign -f -s "$CERT" --timestamp=none {} + 2>/dev/null || true
           MAIN_ENT="build/resign/Payload/LiveContainer.app/LiveContainer.entitlements.plist"
           [ -f "$MAIN_ENT" ] && codesign -f -s "$CERT" --entitlements "$MAIN_ENT" --timestamp=none build/resign/Payload/LiveContainer.app || true
@@ -181,34 +189,34 @@ jobs:
           fi
           echo "IPA_URL=$IPA_URL"
           IPA_URL="$IPA_URL" GIST_TOKEN="$GIST_TOKEN" python3 - <<'PY'
-          import json, os, urllib.parse, urllib.request
+import json, os, urllib.parse, urllib.request
 
-          ipa_url = os.environ["IPA_URL"]
-          gist_token = os.environ.get("GIST_TOKEN", "")
-          plist_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict><key>items</key><array><dict><key>assets</key><array><dict><key>kind</key><string>software-package</string><key>url</key><string>{ipa_url}</string></dict></array><key>metadata</key><dict><key>bundle-identifier</key><string>com.kdt.livecontainer.V9CQYDJ2NX</string><key>bundle-version</key><string>1.0</string><key>kind</key><string>software</string><key>title</key><string>LiveContainer</string></dict></dict></array></dict></plist>"""
+ipa_url = os.environ["IPA_URL"]
+gist_token = os.environ.get("GIST_TOKEN", "")
+plist_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>items</key><array><dict><key>assets</key><array><dict><key>kind</key><string>software-package</string><key>url</key><string>{ipa_url}</string></dict></array><key>metadata</key><dict><key>bundle-identifier</key><string>com.kdt.livecontainer.V9CQYDJ2NX</string><key>bundle-version</key><string>1.0</string><key>kind</key><string>software</string><key>title</key><string>LiveContainer</string></dict></dict></array></dict></plist>"""
 
-          if gist_token:
-              payload = json.dumps({"files": {"manifest.plist": {"content": plist_xml}}}).encode("utf-8")
-              req = urllib.request.Request(
-                  "https://api.github.com/gists/a780f323dcc1db7243c296f4997f43e9",
-                  data=payload,
-                  method="PATCH",
-                  headers={
-                      "Authorization": f"Bearer {gist_token}",
-                      "Content-Type": "application/json",
-                      "User-Agent": "github-actions",
-                  },
-              )
-              res = json.loads(urllib.request.urlopen(req).read().decode("utf-8"))
-              raw_url = res["files"]["manifest.plist"]["raw_url"]
-              itms_url = "itms-services://?action=download-manifest&url=" + urllib.parse.quote(raw_url, safe="")
-              print("GIST_RAW_URL=" + raw_url)
-              print("ITMS_URL=" + itms_url)
-              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
-                  s.write(f"### LiveContainer OTA Link\n`{itms_url}`\n")
-          PY
+if gist_token:
+    payload = json.dumps({"files": {"manifest.plist": {"content": plist_xml}}}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.github.com/gists/a780f323dcc1db7243c296f4997f43e9",
+        data=payload,
+        method="PATCH",
+        headers={
+            "Authorization": f"Bearer {gist_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "github-actions",
+        },
+    )
+    res = json.loads(urllib.request.urlopen(req).read().decode("utf-8"))
+    raw_url = res["files"]["manifest.plist"]["raw_url"]
+    itms_url = "itms-services://?action=download-manifest&url=" + urllib.parse.quote(raw_url, safe="")
+    print("GIST_RAW_URL=" + raw_url)
+    print("ITMS_URL=" + itms_url)
+    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+        s.write(f"### LiveContainer OTA Link\n`{itms_url}`\n")
+PY
 
       - name: Start upterm on failure if requested
         if: failure() && inputs.debug_upterm
