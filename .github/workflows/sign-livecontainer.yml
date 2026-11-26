@@ -169,10 +169,10 @@ jobs:
       - name: Sign IPA with plumesign
         run: |
           plumesign sign \
-            --input build/source.ipa \
-            --output build/LiveContainer+SideStore-signed.ipa \
-            --bundle-id "$BUNDLE_ID" \
-            --udid 00008130-0014442622DB803A
+            --package build/source.ipa \
+            --apple-id \
+            --custom-identifier "$BUNDLE_ID" \
+            --output build/LiveContainer+SideStore-signed.ipa
 
       - name: Strip application-groups from signed Mach-O entitlements and re-sign
         run: |
