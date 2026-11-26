@@ -290,6 +290,13 @@ jobs:
                   if not isinstance(v, list) and k in granted and granted[k] != v:
                       print("value differs:", k, "binary =", v, "| profile =", granted[k])
           PY
+          echo "---- deep codesign verify ----"
+          {
+            echo "### Deep codesign verify"
+            echo '```'
+            codesign --verify --deep --strict --verbose=2 build/inspect/Payload/*.app 2>&1 | tail -30
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Host IPA and update Gist manifest
         env:
@@ -297,14 +304,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           IPA=build/LiveContainer+SideStore-signed.ipa
-          PD_ID=$(curl -fsS -F "file=@$IPA" https://pixeldrain.com/api/file 2>/dev/null | jq -r '.id // empty' || true)
-          if [ -n "$PD_ID" ]; then
-            IPA_URL="https://pixeldrain.com/api/file/${PD_ID}?download"
-          else
-            TAG="signed-$(date +%s)"
-            gh release create "$TAG" "$IPA" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Automated OTA build" --prerelease
-            IPA_URL=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[0].url')
-          fi
+          TAG="signed-$(date +%s)"
+          cp "$IPA" build/LiveContainer-signed.ipa
+          gh release create "$TAG" build/LiveContainer-signed.ipa --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Automated OTA build" --prerelease
+          IPA_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/LiveContainer-signed.ipa"
           echo "IPA_URL=$IPA_URL"
           export IPA_URL
 
@@ -345,6 +348,16 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
               s.write("### LiveContainer OTA Link\n`" + itms + "`\n")
           PY
+
+          echo "---- OTA reachability ----"
+          {
+            echo "### OTA reachability"
+            echo '```'
+            echo "IPA:"
+            curl -sL -A "itunesstored" -o /dev/null -w "http=%{http_code} bytes=%{size_download} type=%{content_type} final=%{url_effective}\n" "$IPA_URL"
+            echo "local size: $(stat -f%z "$IPA")"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Open upterm on failure
         if: failure() && inputs.debug_upterm
