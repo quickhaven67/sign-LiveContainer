@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: "Direct URL to source LiveContainer+SideStore.ipa (defaults to latest release asset)"
+        description: "Direct URL to source LiveContainer+SideStore.ipa (blank = newest matching asset in this repo's releases)"
         required: false
-        default: ""
+        default: "https://github.com/LiveContainer/LiveContainer/releases/download/nightly/LiveContainer+SideStore.ipa"
       ssh_before_auth:
         description: "Open upterm SSH session before running Apple authentication"
         required: false
@@ -128,25 +128,6 @@ jobs:
 
           chmod +x "$HOME/bin/start_upterm.sh" "$HOME/login_apple.sh"
 
-      - name: Open upterm session before authentication
-        if: inputs.ssh_before_auth
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          # Optional lock-down: restrict who can join (see `upterm host --help`),
-          # e.g. UPTERM_ARGS: "--authorized-keys /path/to/keys"
-        run: |
-          "$HOME/bin/start_upterm.sh" "In the SSH session run: ~/login_apple.sh  then type exit to continue."
-
-      - name: Authenticate with Apple Developer account
-        if: ${{ !inputs.ssh_before_auth }}
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-        run: |
-          "$HOME/login_apple.sh"
-
       - name: Download source IPA
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -165,6 +146,25 @@ jobs:
             curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o build/source.ipa "$ASSET_API_URL"
           fi
           ls -lh build/source.ipa
+
+      - name: Open upterm session before authentication
+        if: inputs.ssh_before_auth
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          # Optional lock-down: restrict who can join (see `upterm host --help`),
+          # e.g. UPTERM_ARGS: "--authorized-keys /path/to/keys"
+        run: |
+          "$HOME/bin/start_upterm.sh" "In the SSH session run: ~/login_apple.sh  then type exit to continue."
+
+      - name: Authenticate with Apple Developer account
+        if: ${{ !inputs.ssh_before_auth }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+        run: |
+          "$HOME/login_apple.sh"
 
       - name: Sign IPA with plumesign
         run: |
