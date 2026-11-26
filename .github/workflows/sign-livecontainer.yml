@@ -29,7 +29,6 @@ jobs:
     env:
       GIST_ID: a780f323dcc1db7243c296f4997f43e9
       BUNDLE_ID: com.kdt.livecontainer.V9CQYDJ2NX
-      CERT_NAME: Dennis Lawson
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -147,6 +146,47 @@ jobs:
           fi
           ls -lh build/source.ipa
 
+      - name: Strip application-groups from source IPA entitlements
+        run: |
+          rm -rf build/pre && mkdir -p build/pre
+          unzip -q build/source.ipa -d build/pre
+          python3 - <<'PY'
+          import glob, os, plistlib, subprocess, tempfile
+
+          KEY = "com.apple.security.application-groups"
+          app = glob.glob("build/pre/Payload/*.app")[0]
+          bundles = [app] + sorted(glob.glob(app + "/PlugIns/*.appex"))
+          changed = 0
+
+          for b in bundles:
+              with open(b + "/Info.plist", "rb") as f:
+                  exe = plistlib.load(f).get("CFBundleExecutable")
+              if not exe:
+                  continue
+              path = os.path.join(b, exe)
+              r = subprocess.run(["codesign", "-d", "--entitlements", ":-", path], capture_output=True)
+              if not r.stdout.strip():
+                  print("no embedded entitlements:", path)
+                  continue
+              ent = plistlib.loads(r.stdout)
+              if KEY not in ent:
+                  print("no app-groups:", path)
+                  continue
+              ent.pop(KEY)
+              with tempfile.NamedTemporaryFile(suffix=".plist", delete=False) as t:
+                  plistlib.dump(ent, t)
+              # ad-hoc re-sign ("-"): needs no certificate or keychain
+              r = subprocess.run(["codesign", "-f", "-s", "-", "--entitlements", t.name, "--timestamp=none", path])
+              print("stripped app-groups:", path, "-> codesign exit", r.returncode)
+              if r.returncode != 0:
+                  raise SystemExit(1)
+              changed += 1
+
+          print("binaries changed:", changed)
+          PY
+          (cd build/pre && zip -qry ../stripped.ipa Payload)
+          ls -lh build/stripped.ipa
+
       - name: Open upterm session before authentication
         if: inputs.ssh_before_auth
         env:
@@ -169,66 +209,10 @@ jobs:
       - name: Sign IPA with plumesign
         run: |
           plumesign sign \
-            --package build/source.ipa \
+            --package build/stripped.ipa \
             --apple-id \
             --custom-identifier "$BUNDLE_ID" \
             --output build/LiveContainer+SideStore-signed.ipa
-
-      - name: Strip application-groups from signed Mach-O entitlements and re-sign
-        run: |
-          rm -rf build/resign && mkdir -p build/resign
-          unzip -q build/LiveContainer+SideStore-signed.ipa -d build/resign
-
-          CERT=$(security find-identity -v -p codesigning | awk -v n="$CERT_NAME" 'index($0, n) {print $2; exit}')
-          if [ -z "$CERT" ]; then
-            echo "::error::No codesigning identity matching '$CERT_NAME' in the keychain"
-            security find-identity -v -p codesigning || true
-            exit 1
-          fi
-          export CERT
-
-          python3 - <<'PY'
-          import glob, os, plistlib, re, subprocess
-
-          bins = sorted(
-              glob.glob("build/resign/Payload/*.app/LiveContainer")
-              + glob.glob("build/resign/Payload/*.app/PlugIns/*.appex/*")
-          )
-          for p in bins:
-              if not os.path.isfile(p) or os.path.islink(p):
-                  continue
-              if p.endswith((".plist", ".car", ".mobileprovision", ".appintents", ".intentdefinition", ".bundle")):
-                  continue
-              raw = open(p, "rb").read().decode("latin1")
-              for m in re.findall(r"<\?xml.*?</plist>", raw, re.S):
-                  if "com.apple.security.application-groups" in m:
-                      d = plistlib.loads(m.encode("utf-8"))
-                      d.pop("com.apple.security.application-groups", None)
-                      ent_path = p + ".entitlements.plist"
-                      with open(ent_path, "wb") as f:
-                          plistlib.dump(d, f)
-                      r = subprocess.run(
-                          ["codesign", "-f", "-s", os.environ["CERT"], "--entitlements", ent_path, "--timestamp=none", p],
-                          check=False,
-                      )
-                      print(p, "-> codesign exit", r.returncode)
-                      break
-          PY
-
-          # nested code; preserve the entitlements we just wrote (codesign -f drops them otherwise)
-          find build/resign/Payload -depth \( -name "*.dylib" -o -name "*.framework" -o -name "*.appex" \) \
-            -exec codesign -f -s "$CERT" --preserve-metadata=entitlements --timestamp=none {} + || true
-
-          APP=$(ls -d build/resign/Payload/*.app | head -n 1)
-          MAIN_ENT="$APP/LiveContainer.entitlements.plist"
-          if [ -f "$MAIN_ENT" ]; then
-            codesign -f -s "$CERT" --entitlements "$MAIN_ENT" --timestamp=none "$APP"
-          else
-            echo "::warning::$MAIN_ENT was not generated; app bundle not re-signed"
-          fi
-
-          (cd build/resign && zip -qry ../final.ipa Payload) && mv build/final.ipa build/LiveContainer+SideStore-signed.ipa
-          ls -lh build/LiveContainer+SideStore-signed.ipa
 
       - name: Host IPA and update Gist manifest
         env:
